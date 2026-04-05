@@ -349,7 +349,8 @@ export function createUserRoutes(deps: AppDeps) {
       personalAccessTokens: rows.map((t) => ({
         name: `users/${username}/personalAccessTokens/${t.id}`,
         description: t.description ?? "",
-        createTime: t.created_at,
+        // Proto field created_at → JSON name createdAt (google.protobuf.Timestamp as RFC 3339).
+        createdAt: t.created_at,
       })),
       nextPageToken: "",
     });
@@ -365,19 +366,27 @@ export function createUserRoutes(deps: AppDeps) {
     if (auth.username !== username && auth.role !== "ADMIN") {
       return jsonError(c, GrpcCode.PERMISSION_DENIED, "permission denied");
     }
-    type Body = { personalAccessToken?: { description?: string } };
+    // CreatePersonalAccessTokenRequest (proto): parent + optional description + expires_in_days; HTTP body: "*".
+    type Body = {
+      parent?: string;
+      description?: string;
+      expiresInDays?: number;
+      personalAccessToken?: { description?: string };
+    };
     const body = (await c.req.json()) as Body;
-    const { id, raw } = await repo.createPat(
-      username,
-      body.personalAccessToken?.description ?? null,
-    );
+    const description =
+      typeof body.description === "string"
+        ? body.description
+        : (body.personalAccessToken?.description ?? null);
+    const { id, raw } = await repo.createPat(username, description?.trim() ? description.trim() : null);
     return c.json({
       personalAccessToken: {
         name: `users/${username}/personalAccessTokens/${id}`,
-        description: body.personalAccessToken?.description ?? "",
-        createTime: new Date().toISOString(),
+        description: description?.trim() ?? "",
+        createdAt: new Date().toISOString(),
       },
-      accessToken: raw,
+      // Proto field name is `token` (only returned on create).
+      token: raw,
     });
   });
 

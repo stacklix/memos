@@ -1,0 +1,3 @@
+# Copy to `.dev.vars` or run `npm run dev:worker` (script creates/merges automatically).
+# Wrangler applies this file for local dev only — not sent on `wrangler deploy`.
+MEMOS_DEBUG_HTTP=1

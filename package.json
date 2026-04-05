@@ -1,6 +1,6 @@
 {
   "name": "memos",
-  "version": "0.1.0",
+  "version": "0.26.2",
   "private": true,
   "repository": {
     "type": "git",
@@ -17,7 +17,7 @@
     "db:migrate:sqlite": "tsx scripts/migrate-db.ts",
     "dev": "concurrently -k -c auto -n api,web,urls \"npm run dev:node\" \"npm run dev:web\" \"node scripts/print-dev-urls-when-ready.mjs\"",
     "dev:node": "tsx watch server/node.ts",
-    "dev:worker": "node scripts/ensure-web-build-for-worker.mjs && npm run db:migrate:d1:local && wrangler dev",
+    "dev:worker": "node scripts/ensure-web-build-for-worker.mjs && node scripts/ensure-wrangler-local-dev-vars.mjs && npm run db:migrate:d1:local && wrangler dev",
     "dev:web": "npm --prefix web run dev",
     "build:web": "npm --prefix web install && npm --prefix web run build",
     "build:node": "tsc -p tsconfig.build.json",

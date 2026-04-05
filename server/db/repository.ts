@@ -313,7 +313,9 @@ export function createRepository(sql: SqlAdapter) {
     async findUserByPat(rawToken: string): Promise<DbUserRow | null> {
       const tokenHash = await sha256Hex(rawToken);
       const row = await sql.queryOne<{ username: string }>(
-        "SELECT username FROM personal_access_tokens WHERE token_hash = ?",
+        `SELECT t.username FROM personal_access_tokens t
+         INNER JOIN users u ON u.username = t.username AND u.deleted = 0
+         WHERE t.token_hash = ?`,
         [tokenHash],
       );
       if (!row) return null;

@@ -22,8 +22,9 @@ export default {
       const app = createApp({
         sql,
         demo,
-        instanceVersion: env.MEMOS_VERSION ?? "0.1.0",
+        instanceVersion: env.MEMOS_VERSION ?? "0.0.0",
         instanceUrl,
+        debugHttp: env.MEMOS_DEBUG_HTTP === "1",
       });
       return app.fetch(request, env, ctx);
     }

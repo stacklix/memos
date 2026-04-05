@@ -38,6 +38,15 @@ describe("API", () => {
     expect(body.demo).toBe(true);
   });
 
+  it("GET /api/v1/status is public and 404 (not in golang v1 OpenAPI)", async () => {
+    const app = createApp(testDeps());
+    const res = await app.request("http://localhost/api/v1/status");
+    expect(res.status).toBe(404);
+    const body = (await res.json()) as { code: number; message: string };
+    expect(body.code).toBe(5);
+    expect(body.message).toBe("not found");
+  });
+
   it("POST /api/v1/users creates first admin", async () => {
     const app = createApp(testDeps());
     const res = await app.request("http://localhost/api/v1/users", {

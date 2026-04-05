@@ -10,6 +10,8 @@ export function isPublicApiRoute(method: string, pathname: string): boolean {
   if (pathname === "/api/v1/auth/refresh" && m === "POST") return true;
 
   if (pathname === "/api/v1/instance/profile" && m === "GET") return true;
+  /** Legacy probes; handler returns 404 (not in golang v1 API). */
+  if (pathname === "/api/v1/status" && m === "GET") return true;
   if (m === "GET" && pathname.startsWith("/api/v1/instance/settings/")) return true;
 
   if (pathname === "/api/v1/users" && m === "POST") return true;

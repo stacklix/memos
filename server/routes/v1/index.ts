@@ -6,6 +6,7 @@ import { isPublicApiRoute } from "../../lib/public-routes.js";
 import { GrpcCode, jsonError } from "../../lib/grpc-status.js";
 import { verifyAccessToken } from "../../services/jwt-access.js";
 import { apiCors } from "../../middleware/cors.js";
+import { debugHttpLog } from "../../middleware/debug-http.js";
 import { createAuthRoutes } from "./auth.js";
 import { createInstanceRoutes } from "./instance.js";
 import { createUserRoutes } from "./users.js";
@@ -17,12 +18,14 @@ export function createV1App(deps: AppDeps) {
   const repo = createRepository(deps.sql);
 
   v1.use("*", apiCors);
+  v1.use("*", debugHttpLog(Boolean(deps.debugHttp)));
 
   v1.use("*", async (c, next) => {
     c.set("auth", null);
     const header = c.req.header("authorization");
-    if (header?.startsWith("Bearer ")) {
-      const token = header.slice(7).trim();
+    const bearer = header?.match(/^\s*Bearer\s+(.+)$/i)?.[1];
+    if (bearer) {
+      const token = bearer.trim();
       const jwtSecret = deps.demo ? "usememos" : (await repo.getSecretKey());
       if (jwtSecret) {
         const access = await verifyAccessToken(token, jwtSecret);
@@ -56,6 +59,12 @@ export function createV1App(deps: AppDeps) {
     if (c.get("auth")) return next();
     return jsonError(c, GrpcCode.UNAUTHENTICATED, "permission denied");
   });
+
+  /**
+   * Not in golang v1 OpenAPI (`proto/gen/openapi.yaml`). Kept as public 404 so legacy probes fail cleanly
+   * and clients can use `GET /api/v1/instance/profile` (version, demo, admin) instead.
+   */
+  v1.get("/status", (c) => jsonError(c, GrpcCode.NOT_FOUND, "not found"));
 
   v1.get("/users:stats", async (c) => {
     const users = await repo.listUsers({ limit: 1000, offset: 0 });

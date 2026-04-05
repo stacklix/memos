@@ -1,6 +1,11 @@
 import type { DbMemoRow, DbUserRow } from "../db/repository.js";
 import { deriveMemoProperty } from "../services/memo-content-props.js";
 
+/** Proto JSON / picky clients (e.g. Swift OpenAPI date-time) often match this shape; see `auth/signin` accessTokenExpiresAt. */
+export function protoJsonTimestamp(iso: string): string {
+  return iso.replace(/\.\d{1,9}Z$/, "Z");
+}
+
 export function userToJson(u: DbUserRow) {
   return {
     name: `users/${u.username}`,
@@ -11,8 +16,8 @@ export function userToJson(u: DbUserRow) {
     avatarUrl: u.avatar_url ?? "",
     description: u.description ?? "",
     state: u.state,
-    createTime: u.create_time,
-    updateTime: u.update_time,
+    createTime: protoJsonTimestamp(u.create_time),
+    updateTime: protoJsonTimestamp(u.update_time),
   };
 }
 
@@ -30,9 +35,9 @@ export function memoToJson(m: DbMemoRow, extras?: { tags?: string[] }) {
     name: `memos/${m.id}`,
     state: m.state,
     creator: `users/${m.creator_username}`,
-    createTime: m.create_time,
-    updateTime: m.update_time,
-    displayTime: m.display_time ?? m.create_time,
+    createTime: protoJsonTimestamp(m.create_time),
+    updateTime: protoJsonTimestamp(m.update_time),
+    displayTime: protoJsonTimestamp(m.display_time ?? m.create_time),
     content: m.content,
     visibility: m.visibility,
     tags: extras?.tags ?? [],

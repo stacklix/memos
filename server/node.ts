@@ -5,6 +5,7 @@ import { existsSync, mkdirSync, readFileSync, statSync } from "node:fs";
 import { dirname, extname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { createApp } from "./app.js";
+import { readRootPackageJsonVersion } from "./lib/root-package-version.js";
 import { createBetterSqliteAdapter } from "./db/better-sqlite-adapter.js";
 import { migrateBetterSqliteFromDir } from "./db/migrate.js";
 import { assertMigrationsDirReadable, resolveMigrationsDirectory } from "./lib/initial-migration-sql.js";
@@ -60,12 +61,23 @@ const port = Number(process.env.PORT) || 3000;
 const instanceUrl =
   process.env.MEMOS_INSTANCE_URL ?? `http://localhost:${port}`;
 
+/** Local `tsx server/node.ts`: set MEMOS_DEBUG_HTTP=1 unless MEMOS_DEBUG_HTTP=0. `dist/server`: off unless MEMOS_DEBUG_HTTP=1. */
+if (!isDistServerModuleDir(__dirname) && process.env.MEMOS_DEBUG_HTTP !== "0") {
+  process.env.MEMOS_DEBUG_HTTP ??= "1";
+}
+const debugHttp = process.env.MEMOS_DEBUG_HTTP === "1";
 const inner = createApp({
   sql,
   demo,
-  instanceVersion: process.env.MEMOS_VERSION ?? "0.1.0",
+  instanceVersion: process.env.MEMOS_VERSION ?? readRootPackageJsonVersion(__dirname),
   instanceUrl,
+  debugHttp,
 });
+if (debugHttp) {
+  console.log(
+    "[memos] MEMOS_DEBUG_HTTP=1 — [debug:http] for /api/v1. Quiet: MEMOS_DEBUG_HTTP=0. Worker local: .dev.vars (see dev:worker).",
+  );
+}
 
 const app = new Hono();
 

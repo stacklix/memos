@@ -16,6 +16,15 @@
 - **除 `golang` 以外的任意分支**（含 **`master`** 上的 TypeScript/Hono、`web/`、特性分支等）在 **新增或改动对外 API** 时，都必须 **对照 `golang` 分支**：查阅 **`proto/`** 与 Go **`server/router/api/v1/`** 等处的行为，使路径、方法、请求/响应 JSON（字段名、嵌套结构、proto JSON 映射）、`update_mask` / `FieldMask` 路径以及可选字段与 **`null`** 等语义与参考实现一致，避免私自分叉接口。
 - 日常协作的 **规范 Git 远程** 仍以本仓库 **`stacklix/memos`** 为准；做契约比对时使用本仓库 **`golang`** 分支（例如 `git show golang:proto/...`），无需改以其他随意 fork 为准。
 
+### API 调整与 `golang` 不一致时的处理（代理必读）
+
+在拟对 **HTTP 方法、路径、请求体/查询参数、响应 JSON 形状或语义** 做任何修改前，须先与 **`golang` 分支** 中的契约比对（优先 **`golang:proto/`** 的 `*.proto`、`google.api.http` 注解，以及 **`golang:proto/gen/openapi.yaml`**；必要时对照 Go **`server/router/api/v1/`** 行为）。
+
+- **若与 `golang` 一致**：可按同一契约实现或修正 TypeScript/Hono（及必要的 `web/`、`tests/`）。
+- **若拟议修改与 `golang` 不一致**（例如路径/方法不同、字段名或类型不同、多删改公开字段、与 proto JSON 映射不符）：**不得直接改代码**。应向 **用户** 说明差异点（当前契约 vs 拟议行为）、影响面（客户端、兼容性），并 **等待用户明确确认**（例如同意刻意分叉、或先改 proto/Go 再跟 TS）后，再按确认结果修改。
+
+未获用户确认前，代理仅可做只读调查、对比与建议文案，不实施会偏离 `golang` 契约的 API 变更。
+
 ## `dist/`、`web/` 与构建
 
 | 目录 | 角色 |

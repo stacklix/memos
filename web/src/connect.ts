@@ -4,6 +4,7 @@
  */
 import { create } from "@bufbuild/protobuf";
 import { Code, ConnectError } from "@connectrpc/connect";
+import type { FieldMask } from "@bufbuild/protobuf/wkt";
 import { timestampDate, timestampFromDate } from "@bufbuild/protobuf/wkt";
 import { getAccessToken, hasStoredToken, isTokenExpired, REQUEST_TOKEN_EXPIRY_BUFFER_MS, setAccessToken } from "./auth-state";
 import { memoFromJson, userFromJson } from "./lib/proto-adapters";
@@ -26,8 +27,10 @@ import type { Memo, MemoShare, MemoRelation, Reaction } from "./types/proto/api/
 import { MemoShareSchema, MemoRelationSchema, ReactionSchema } from "./types/proto/api/v1/memo_service_pb";
 import type { Shortcut } from "./types/proto/api/v1/shortcut_service_pb";
 import { ShortcutSchema } from "./types/proto/api/v1/shortcut_service_pb";
-import type { FieldMask, User, UserSetting } from "./types/proto/api/v1/user_service_pb";
+import type { CreatePersonalAccessTokenResponse, PersonalAccessToken, User, UserSetting } from "./types/proto/api/v1/user_service_pb";
 import {
+  CreatePersonalAccessTokenResponseSchema,
+  PersonalAccessTokenSchema,
   UserSettingSchema,
   UserSetting_GeneralSettingSchema,
   UserSetting_WebhooksSettingSchema,
@@ -470,18 +473,55 @@ export const userServiceClient = {
     await throwUnlessOk(res);
     return userSettingFromJson((await readJson(res)) as Record<string, unknown>);
   },
-  async listPersonalAccessTokens(req: { parent: string }) {
+  async listPersonalAccessTokens(req: { parent: string }): Promise<{ personalAccessTokens: PersonalAccessToken[] }> {
     const u = userSeg(req.parent);
     const j = await apiJson<{
-      personalAccessTokens: { name: string; description: string; createTime: string }[];
+      personalAccessTokens: { name: string; description?: string; createdAt?: string; createTime?: string }[];
     }>(`/users/${encodeURIComponent(u)}/personalAccessTokens`);
-    return j;
+    return {
+      personalAccessTokens: j.personalAccessTokens.map((row) => {
+        const iso = row.createdAt ?? row.createTime;
+        return create(PersonalAccessTokenSchema, {
+          name: row.name,
+          description: row.description ?? "",
+          createdAt: iso ? timestampFromDate(new Date(iso)) : undefined,
+        });
+      }),
+    };
   },
-  async createPersonalAccessToken(req: { parent: string; personalAccessToken?: { description?: string } }) {
-    const u = userSeg(req.parent);
-    return apiJson<Record<string, unknown>>(`/users/${encodeURIComponent(u)}/personalAccessTokens`, {
+  async createPersonalAccessToken(req: {
+    parent?: string;
+    personalAccessToken?: { description?: string };
+    description?: string;
+    expiresInDays?: number;
+  }): Promise<CreatePersonalAccessTokenResponse> {
+    const u = userSeg(req.parent ?? "");
+    if (!u) {
+      throw new ConnectError("invalid parent", Code.InvalidArgument);
+    }
+    const description = req.description ?? req.personalAccessToken?.description ?? "";
+    const raw = await apiJson<{
+      personalAccessToken?: { name: string; description?: string; createdAt?: string; createTime?: string };
+      token?: string;
+      accessToken?: string;
+    }>(`/users/${encodeURIComponent(u)}/personalAccessTokens`, {
       method: "POST",
-      body: JSON.stringify({ personalAccessToken: req.personalAccessToken ?? {} }),
+      body: JSON.stringify({
+        description,
+        expiresInDays: req.expiresInDays ?? 0,
+      }),
+    });
+    const meta = raw.personalAccessToken;
+    const iso = meta?.createdAt ?? meta?.createTime;
+    return create(CreatePersonalAccessTokenResponseSchema, {
+      personalAccessToken: meta
+        ? create(PersonalAccessTokenSchema, {
+            name: meta.name,
+            description: meta.description ?? "",
+            createdAt: iso ? timestampFromDate(new Date(iso)) : undefined,
+          })
+        : undefined,
+      token: raw.token ?? raw.accessToken ?? "",
     });
   },
   async deletePersonalAccessToken(req: { name: string }): Promise<object> {
