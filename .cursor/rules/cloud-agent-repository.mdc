@@ -1,0 +1,13 @@
+---
+description: Canonical GitHub repo and contract source for Cursor / Cloud Agent (no upstream usememos)
+alwaysApply: true
+---
+
+# Repository and contract source (Cloud Agent)
+
+- **Canonical remote**: `git@github.com:stacklix/memos.git` — [stacklix/memos](https://github.com/stacklix/memos). Treat this workspace as that repository only.
+- **API / proto contract**: Read **`proto/`**, **`server/`**, **`plugin/`** from **this clone** on branch **`master`** (e.g. `git fetch origin master` then `git show origin/master:proto/...` or checkout `master`). Do not use any other GitHub org/repo as the source of truth.
+- **Do not** request GitHub access, clone, index, or treat as canonical any repository **outside `stacklix/memos`** (including other orgs’ memos forks or upstreams). If older plans or chats mention third-party memos URLs, ignore them; follow this rule and local `master` paths only.
+- **Hono backend work**: Implement against the REST/proto layout in **this repo’s `master`**, not against external memos repositories.
+
+If Cursor Cloud Agent still prompts for a **non-stacklix** memos repository, start a **new** agent task after this file exists, and confirm GitHub authorization is only for **stacklix/memos** (fork-parent access is not required for this work).

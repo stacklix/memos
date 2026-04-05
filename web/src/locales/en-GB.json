@@ -1,0 +1,19 @@
+{
+  "setting": {
+    "sso": {
+      "authorization-endpoint": "Authorisation endpoint"
+    },
+    "system": {
+      "customize-server": {
+        "title": "Customise Server"
+      }
+    },
+    "webhook": {
+      "label": "Webhooks"
+    }
+  },
+  "auth": {
+    "protected-memo-notice": "This memo is not public. Sign in to continue."
+  },
+  "memo": {}
+}

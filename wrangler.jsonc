@@ -1,0 +1,22 @@
+{
+  "$schema": "./node_modules/wrangler/config-schema.json",
+  "name": "memos",
+  "main": "server/worker.ts",
+  "compatibility_date": "2025-04-01",
+  "vars": {
+    "MEMOS_VERSION": "0.1.0"
+  },
+  "d1_databases": [
+    {
+      "binding": "MEMOS_DB",
+      "database_name": "memos",
+      "database_id": "00000000-0000-0000-0000-000000000001",
+      "migrations_dir": "./migrations"
+    }
+  ],
+  "assets": {
+    "directory": "./dist/public",
+    "binding": "ASSETS",
+    "run_worker_first": true
+  }
+}

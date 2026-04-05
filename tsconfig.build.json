@@ -1,0 +1,16 @@
+{
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "noEmit": false,
+    "outDir": "dist/server",
+    "rootDir": "server",
+    "types": ["node"]
+  },
+  "include": ["server/**/*.ts"],
+  "exclude": [
+    "server/worker.ts",
+    "server/db/d1-adapter.ts",
+    "server/types/bindings.ts",
+    "**/*.test.ts"
+  ]
+}
