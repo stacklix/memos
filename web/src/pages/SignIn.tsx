@@ -2,6 +2,7 @@ import { useEffect } from "react";
 import { Link, useSearchParams } from "react-router-dom";
 import AuthFooter from "@/components/AuthFooter";
 import PasswordSignInForm from "@/components/PasswordSignInForm";
+import SsoSignInForm from "@/components/SsoSignInForm";
 import { useInstance } from "@/contexts/InstanceContext";
 import useCurrentUser from "@/hooks/useCurrentUser";
 import { ROUTES } from "@/router/routes";
@@ -34,6 +35,7 @@ const SignIn = () => {
         ) : (
           <p className="w-full text-2xl mt-2 text-muted-foreground">Password auth is not allowed.</p>
         )}
+        <SsoSignInForm redirectPath={redirectTarget} />
         {!instanceGeneralSetting.disallowUserRegistration && !instanceGeneralSetting.disallowPasswordAuth && (
           <p className="w-full mt-4 text-sm">
             <span className="text-muted-foreground">{t("auth.sign-up-tip")}</span>

@@ -12,6 +12,7 @@ import { createInstanceRoutes } from "./instance.js";
 import { createUserRoutes } from "./users.js";
 import { createMemoRoutes, createShareByTokenRoute } from "./memos.js";
 import { createAttachmentRoutes } from "./attachments.js";
+import { createIdentityProviderRoutes } from "./idp.js";
 import { userStatsFieldsFromMemoRows } from "../../lib/user-stats-from-memos.js";
 
 export function createV1App(deps: AppDeps) {
@@ -105,6 +106,7 @@ export function createV1App(deps: AppDeps) {
   v1.route("/users", createUserRoutes(deps));
   v1.route("/memos", createMemoRoutes(deps));
   v1.route("/attachments", createAttachmentRoutes(deps));
+  v1.route("/identity-providers", createIdentityProviderRoutes(deps));
   v1.route("/shares", createShareByTokenRoute(deps));
 
   return v1;

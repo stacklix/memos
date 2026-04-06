@@ -33,6 +33,7 @@ const NotFound = lazyWithReload(() => import("@/pages/NotFound"));
 const PermissionDenied = lazyWithReload(() => import("@/pages/PermissionDenied"));
 const Setting = lazyWithReload(() => import("@/pages/Setting"));
 const SignIn = lazyWithReload(() => import("@/pages/SignIn"));
+const AuthCallback = lazyWithReload(() => import("@/pages/AuthCallback"));
 const SignUp = lazyWithReload(() => import("@/pages/SignUp"));
 const UserProfile = lazyWithReload(() => import("@/pages/UserProfile"));
 
@@ -52,6 +53,7 @@ const router = createBrowserRouter([
         path: Routes.AUTH,
         children: [
           { path: "", element: <SignIn /> },
+          { path: "callback", element: <AuthCallback /> },
           { path: "admin", element: <AdminSignIn /> },
           { path: "signup", element: <SignUp /> },
         ],

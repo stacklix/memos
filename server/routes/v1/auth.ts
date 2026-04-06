@@ -8,10 +8,35 @@ import type { AppDeps } from "../../types/deps.js";
 import { createRepository } from "../../db/repository.js";
 import { GrpcCode, jsonError } from "../../lib/grpc-status.js";
 import { verifyPassword } from "../../services/password.js";
+import { hashPassword } from "../../services/password.js";
 import { signAccessToken } from "../../services/jwt-access.js";
 import { signRefreshToken, verifyRefreshToken } from "../../services/jwt-refresh.js";
 import { buildRefreshCookie, parseCookieHeader, REFRESH_COOKIE_NAME } from "../../lib/cookies.js";
 import { authPrincipalFromUserRow, userToJson } from "../../lib/serializers.js";
+import {
+  exchangeOAuth2Token,
+  fetchOAuth2UserInfo,
+  parseOAuth2Config,
+} from "../../services/oauth2-idp.js";
+
+function extractIdentityProviderUid(name: string): string | null {
+  const prefix = "identity-providers/";
+  if (!name.startsWith(prefix)) return null;
+  const uid = name.slice(prefix.length).trim();
+  if (!uid || !/^[a-z0-9][a-z0-9-]{0,31}$/i.test(uid)) return null;
+  return uid;
+}
+
+function randomPassword(length: number): string {
+  const alphabet =
+    "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+  const bytes = crypto.getRandomValues(new Uint8Array(length));
+  let out = "";
+  for (let i = 0; i < bytes.length; i++) {
+    out += alphabet[bytes[i]! % alphabet.length];
+  }
+  return out;
+}
 
 export function createAuthRoutes(deps: AppDeps) {
   const r = new Hono<{ Variables: ApiVariables }>();
@@ -34,26 +59,106 @@ export function createAuthRoutes(deps: AppDeps) {
     } catch {
       return jsonError(c, GrpcCode.INVALID_ARGUMENT, "invalid request body");
     }
-    if (body.ssoCredentials) {
-      return jsonError(c, GrpcCode.UNIMPLEMENTED, "SSO is not implemented");
-    }
-    const creds = body.passwordCredentials;
-    if (!creds) {
+    let user = null;
+    if (body.passwordCredentials) {
+      const creds = body.passwordCredentials;
+      const general = await repo.getGeneralSetting();
+      if (general.disallowPasswordAuth) {
+        return jsonError(c, GrpcCode.FAILED_PRECONDITION, "password auth disabled");
+      }
+      user = await repo.getUser(creds.username);
+      if (!user) {
+        return jsonError(c, GrpcCode.UNAUTHENTICATED, "invalid username or password");
+      }
+      const ok = await verifyPassword(creds.password, user.password_hash);
+      if (!ok) {
+        return jsonError(c, GrpcCode.UNAUTHENTICATED, "invalid username or password");
+      }
+    } else if (body.ssoCredentials) {
+      const sso = body.ssoCredentials;
+      const uid = extractIdentityProviderUid(sso.idpName);
+      if (!uid) {
+        return jsonError(c, GrpcCode.INVALID_ARGUMENT, "invalid identity provider name");
+      }
+      const provider = await repo.getIdentityProviderByUid(uid);
+      if (!provider) {
+        return jsonError(c, GrpcCode.INVALID_ARGUMENT, "identity provider not found");
+      }
+      if (provider.type !== "OAUTH2") {
+        return jsonError(c, GrpcCode.INVALID_ARGUMENT, "unsupported identity provider type");
+      }
+      let providerConfig: unknown = {};
+      try {
+        providerConfig = JSON.parse(provider.config);
+      } catch {
+        return jsonError(c, GrpcCode.INTERNAL, "invalid identity provider config");
+      }
+      const oauth2Config = parseOAuth2Config(providerConfig);
+      if (!oauth2Config) {
+        return jsonError(c, GrpcCode.INTERNAL, "invalid identity provider config");
+      }
+      let oauthAccessToken = "";
+      try {
+        oauthAccessToken = await exchangeOAuth2Token({
+          config: oauth2Config,
+          redirectUri: sso.redirectUri,
+          code: sso.code,
+          codeVerifier: sso.codeVerifier,
+        });
+      } catch (error) {
+        const message = error instanceof Error ? error.message : "failed to exchange token";
+        return jsonError(c, GrpcCode.INTERNAL, message);
+      }
+      let userInfo: {
+        identifier: string;
+        displayName: string;
+        email: string;
+        avatarUrl: string;
+      };
+      try {
+        userInfo = await fetchOAuth2UserInfo({
+          config: oauth2Config,
+          accessToken: oauthAccessToken,
+        });
+      } catch (error) {
+        const message = error instanceof Error ? error.message : "failed to get user info";
+        return jsonError(c, GrpcCode.INTERNAL, message);
+      }
+      if (provider.identifier_filter) {
+        let regex: RegExp;
+        try {
+          regex = new RegExp(provider.identifier_filter);
+        } catch {
+          return jsonError(c, GrpcCode.INTERNAL, "invalid identity provider identifier filter");
+        }
+        if (!regex.test(userInfo.identifier)) {
+          return jsonError(c, GrpcCode.PERMISSION_DENIED, "identifier is not allowed");
+        }
+      }
+      user = await repo.getUser(userInfo.identifier);
+      if (!user) {
+        const general = await repo.getGeneralSetting();
+        if (general.disallowUserRegistration) {
+          return jsonError(c, GrpcCode.PERMISSION_DENIED, "user registration is not allowed");
+        }
+        const passwordHash = await hashPassword(randomPassword(20));
+        user = await repo.createUser({
+          username: userInfo.identifier,
+          passwordHash,
+          role: "USER",
+          displayName: userInfo.displayName,
+          email: userInfo.email,
+        });
+        if (userInfo.avatarUrl) {
+          await repo.updateUser(user.username, { avatar_url: userInfo.avatarUrl });
+          user = await repo.getUser(user.username);
+        }
+      }
+    } else {
       return jsonError(c, GrpcCode.INVALID_ARGUMENT, "credentials required");
     }
-    const general = await repo.getGeneralSetting();
-    if (general.disallowPasswordAuth) {
-      return jsonError(c, GrpcCode.FAILED_PRECONDITION, "password auth disabled");
-    }
+    if (!user) return jsonError(c, GrpcCode.INVALID_ARGUMENT, "invalid credentials");
     if (!deps.demo) await repo.ensureSecretKey();
-    const user = await repo.getUser(creds.username);
-    if (!user) {
-      return jsonError(c, GrpcCode.UNAUTHENTICATED, "invalid username or password");
-    }
-    const ok = await verifyPassword(creds.password, user.password_hash);
-    if (!ok) {
-      return jsonError(c, GrpcCode.UNAUTHENTICATED, "invalid username or password");
-    }
     const jwtSecret = deps.demo ? "usememos" : (await repo.getSecretKey())!;
     const userId = await repo.getUserInternalId(user.username);
     if (userId == null) {

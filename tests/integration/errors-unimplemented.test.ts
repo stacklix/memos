@@ -51,14 +51,14 @@ describe("integration: errors and unimplemented", () => {
     expect(res.status).toBeGreaterThanOrEqual(400);
   });
 
-  it("SSO signin returns 501", async () => {
+  it("SSO signin validates request body", async () => {
     const app = createTestApp();
     const res = await apiJson(app, "/api/v1/auth/signin", {
       method: "POST",
       json: { ssoCredentials: { something: 1 } },
     });
-    expect(res.status).toBe(501);
-    expect((res.body as { code: number }).code).toBe(12);
+    expect(res.status).toBe(400);
+    expect((res.body as { code: number }).code).toBe(3);
   });
 
   it("memo attachments routes are implemented", async () => {

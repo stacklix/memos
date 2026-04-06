@@ -123,6 +123,14 @@ export type DbAttachmentRow = {
   payload: string;
 };
 
+export type DbIdentityProviderRow = {
+  uid: string;
+  name: string;
+  type: string;
+  identifier_filter: string;
+  config: string;
+};
+
 type SqlUserRow = {
   id: number;
   username: string;
@@ -659,6 +667,55 @@ export function createRepository(sql: SqlAdapter) {
         [USER_SETTING_KEY_PERSONAL_ACCESS_TOKENS, tokenHash, tokenHash],
       );
       return r ? mapUserRow(r) : null;
+    },
+
+    async listIdentityProviders(): Promise<DbIdentityProviderRow[]> {
+      return sql.queryAll<DbIdentityProviderRow>(
+        "SELECT uid, name, type, identifier_filter, config FROM idp ORDER BY id ASC",
+      );
+    },
+
+    async getIdentityProviderByUid(uid: string): Promise<DbIdentityProviderRow | null> {
+      const row = await sql.queryOne<DbIdentityProviderRow>(
+        "SELECT uid, name, type, identifier_filter, config FROM idp WHERE uid = ?",
+        [uid],
+      );
+      return row ?? null;
+    },
+
+    async createIdentityProvider(args: {
+      uid: string;
+      name: string;
+      type: string;
+      identifierFilter: string;
+      configJson: string;
+    }): Promise<void> {
+      await sql.execute(
+        `INSERT INTO idp (uid, name, type, identifier_filter, config)
+         VALUES (?, ?, ?, ?, ?)`,
+        [args.uid, args.name, args.type, args.identifierFilter, args.configJson],
+      );
+    },
+
+    async updateIdentityProvider(args: {
+      uid: string;
+      name: string;
+      type: string;
+      identifierFilter: string;
+      configJson: string;
+    }): Promise<boolean> {
+      const result = await sql.execute(
+        `UPDATE idp
+         SET name = ?, type = ?, identifier_filter = ?, config = ?
+         WHERE uid = ?`,
+        [args.name, args.type, args.identifierFilter, args.configJson, args.uid],
+      );
+      return result.changes > 0;
+    },
+
+    async deleteIdentityProvider(uid: string): Promise<boolean> {
+      const result = await sql.execute("DELETE FROM idp WHERE uid = ?", [uid]);
+      return result.changes > 0;
     },
 
     async createMemo(args: {

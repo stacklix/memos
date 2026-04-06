@@ -1,6 +1,6 @@
 /**
  * HTTP routes that skip Bearer/PAT authentication, aligned with
- * `server/router/api/v1/acl_config.go` `PublicMethods` (IdentityProvider omitted).
+ * `server/router/api/v1/acl_config.go` `PublicMethods`.
  */
 export function isPublicApiRoute(method: string, pathname: string): boolean {
   const m = method.toUpperCase();
@@ -22,6 +22,8 @@ export function isPublicApiRoute(method: string, pathname: string): boolean {
     if (rest.includes(":")) return false;
     return true;
   }
+
+  if (pathname === "/api/v1/identity-providers" && m === "GET") return true;
 
   if (pathname === "/api/v1/memos" && m === "GET") return true;
   if (m === "GET" && /^\/api\/v1\/memos\/[^/]+$/.test(pathname)) return true;

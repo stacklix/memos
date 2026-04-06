@@ -329,6 +329,37 @@ describe("integration: memos", () => {
     expect(authed.body.memos.length).toBe(2);
   });
 
+  it("admin cannot list other users PRIVATE memos by default", async () => {
+    const app = createTestApp();
+    const { accessToken: adminTok } = await seedAdmin(app, { username: "adm2", password: "secret123" });
+    await postUserAsAdmin(app, adminTok, { username: "alice", password: "secret123", role: "USER" });
+    const { accessToken: aliceTok } = await signIn(app, "alice", "secret123");
+    await postMemo(app, aliceTok, { content: "alice private", visibility: "PRIVATE" });
+    await postMemo(app, aliceTok, { content: "alice protected", visibility: "PROTECTED" });
+    await postMemo(app, aliceTok, { content: "alice public", visibility: "PUBLIC" });
+
+    const list = await apiJson<{ memos: { content: string }[] }>(app, "/api/v1/memos?pageSize=50", {
+      bearer: adminTok,
+    });
+    expect(list.status).toBe(200);
+    const contents = list.body.memos.map((m) => m.content);
+    expect(contents).toContain("alice public");
+    expect(contents).toContain("alice protected");
+    expect(contents).not.toContain("alice private");
+  });
+
+  it("admin cannot GET another user's PRIVATE memo", async () => {
+    const app = createTestApp();
+    const { accessToken: adminTok } = await seedAdmin(app, { username: "adm3", password: "secret123" });
+    await postUserAsAdmin(app, adminTok, { username: "bob", password: "secret123", role: "USER" });
+    const { accessToken: bobTok } = await signIn(app, "bob", "secret123");
+    const created = await postMemo(app, bobTok, { content: "bob private", visibility: "PRIVATE" });
+    const id = memoIdFromName((created.body as { name: string }).name);
+
+    const get = await apiJson(app, `/api/v1/memos/${encodeURIComponent(id)}`, { bearer: adminTok });
+    expect(get.status).toBe(403);
+  });
+
   it("GET /memos with tag filter returns matching memo", async () => {
     const app = createTestApp();
     await postFirstUser(app, { username: "filtag", password: "secret123", role: "USER" });

@@ -10,8 +10,6 @@
 | --------------------------------- | ----------------------------------------------------------------------- |
 | Memo 列表/探索/归档/用户页                 | `filter` 语义为子集实现，复杂表达式与 `golang` 不完全兼容                                  |
 | Memo 详情与附件相关能力                    | 主要剩余差异为附件过滤语法仍是子集实现（已在顶层附件与 memo 附件链路统一同一子集规则，仍非完整 CEL）                 |
-| SSO 登录回调                          | `AuthCallback` 页面仍在代码中，但路由已移除；`signin.ssoCredentials` 为 `UNIMPLEMENTED` |
-| SSO 管理                            | `SSOSection` 已从设置页移除；IdP 前端能力未接入                                        |
 | 实时刷新（SSE）                         | 前端有实时预期，但后端缺少 `/api/v1/sse`                                             |
 
 
@@ -24,8 +22,6 @@
 
 | 分类                     | 差异                                                                    |
 | ---------------------- | --------------------------------------------------------------------- |
-| Identity Provider（IdP） | 缺少 `/api/v1/identity-providers*` 等价路由                                 |
-| SSO 登录分支               | `POST /api/v1/auth/signin` 的 `ssoCredentials` 未实现（返回 `UNIMPLEMENTED`） |
 | SSE                    | 缺少 `/api/v1/sse` 等价能力                                                 |
 | MCP                    | 缺少 `server/router/mcp/*` 等价路由能力                                       |
 
@@ -72,7 +68,6 @@
 | 主数据库运行时    | `golang` 为单一运行时形态；当前分支为 Node（SQLite）+ Worker（D1）双后端                                    |
 | 对象存储链路     | `golang` 以 S3 链路为主；当前分支支持 `DB/LOCAL/S3/R2`，跨后端行为仍需继续用 golden 用例验证（特别是 filter 与图像处理覆盖面） |
 | 实时通道       | `golang` 有 SSE；当前分支缺失 SSE 路由                                                           |
-| 外部 IdP/SSO | `golang` 有完整 IdP + SSO；当前分支未接入                                                         |
 | MCP 对外接口   | `golang` 有 `mcp/*`；当前分支无等价接口                                                           |
 | 邮件通知外部服务   | `NOTIFICATION` 设置项已可读写；评论通知 webhook + SMTP 邮件投递链路已形成 |
 

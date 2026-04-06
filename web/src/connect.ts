@@ -34,6 +34,11 @@ import type { Attachment } from "./types/proto/api/v1/attachment_service_pb";
 import { AttachmentSchema } from "./types/proto/api/v1/attachment_service_pb";
 import type { Shortcut } from "./types/proto/api/v1/shortcut_service_pb";
 import { ShortcutSchema } from "./types/proto/api/v1/shortcut_service_pb";
+import type { IdentityProvider } from "./types/proto/api/v1/idp_service_pb";
+import {
+  IdentityProviderSchema,
+  IdentityProvider_Type,
+} from "./types/proto/api/v1/idp_service_pb";
 import type { CreatePersonalAccessTokenResponse, PersonalAccessToken, User, UserSetting } from "./types/proto/api/v1/user_service_pb";
 import {
   CreatePersonalAccessTokenResponseSchema,
@@ -1025,16 +1030,62 @@ export const attachmentServiceClient = {
 };
 
 export const identityProviderServiceClient = {
-  async listIdentityProviders(): Promise<{ identityProviders: never[] }> {
-    return { identityProviders: [] };
+  async listIdentityProviders(_req?: object): Promise<{ identityProviders: IdentityProvider[] }> {
+    const j = await apiJson<{ identityProviders?: Record<string, unknown>[] }>("/identity-providers");
+    const identityProviders = (j.identityProviders ?? []).map((row) =>
+      create(IdentityProviderSchema, {
+        name: String(row.name ?? ""),
+        title: String(row.title ?? ""),
+        type:
+          row.type === "OAUTH2" || Number(row.type) === IdentityProvider_Type.OAUTH2
+            ? IdentityProvider_Type.OAUTH2
+            : IdentityProvider_Type.TYPE_UNSPECIFIED,
+        identifierFilter: String(row.identifierFilter ?? ""),
+        config: {
+          config: {
+            case: "oauth2Config",
+            value: (row.config as { oauth2Config?: Record<string, unknown> } | undefined)
+              ?.oauth2Config ?? {},
+          },
+        },
+      } as Record<string, unknown>),
+    );
+    return { identityProviders };
   },
-  async createIdentityProvider(): Promise<never> {
-    throw new ConnectError("SSO is not supported", Code.Unimplemented);
+  async createIdentityProvider(req: {
+    identityProvider?: IdentityProvider;
+    identityProviderId?: string;
+  }): Promise<IdentityProvider> {
+    const body = {
+      identityProvider: req.identityProvider,
+      identityProviderId: req.identityProviderId ?? "",
+    };
+    const j = await apiJson<Record<string, unknown>>("/identity-providers", {
+      method: "POST",
+      body: JSON.stringify(body),
+    });
+    return create(IdentityProviderSchema, j);
   },
-  async updateIdentityProvider(): Promise<never> {
-    throw new ConnectError("SSO is not supported", Code.Unimplemented);
+  async updateIdentityProvider(req: {
+    identityProvider?: IdentityProvider;
+    updateMask?: FieldMask;
+  }): Promise<IdentityProvider> {
+    if (!req.identityProvider?.name) {
+      throw new ConnectError("identityProvider.name is required", Code.InvalidArgument);
+    }
+    const uid = req.identityProvider.name.replace(/^identity-providers\//, "");
+    const j = await apiJson<Record<string, unknown>>(`/identity-providers/${encodeURIComponent(uid)}`, {
+      method: "PATCH",
+      body: JSON.stringify({
+        identityProvider: req.identityProvider,
+        updateMask: req.updateMask,
+      }),
+    });
+    return create(IdentityProviderSchema, j);
   },
-  async deleteIdentityProvider(): Promise<never> {
-    throw new ConnectError("SSO is not supported", Code.Unimplemented);
+  async deleteIdentityProvider(req: { name: string }): Promise<object> {
+    const uid = req.name.replace(/^identity-providers\//, "");
+    await apiJson(`/identity-providers/${encodeURIComponent(uid)}`, { method: "DELETE" });
+    return {};
   },
 };

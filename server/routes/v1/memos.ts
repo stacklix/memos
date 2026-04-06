@@ -36,7 +36,7 @@ function canViewMemo(
   if (m.visibility === "PUBLIC") return true;
   if (!auth) return false;
   if (m.visibility === "PROTECTED") return true;
-  return m.creator_username === auth.username || auth.role === "ADMIN";
+  return m.creator_username === auth.username;
 }
 
 export function createMemoRoutes(deps: AppDeps) {
@@ -90,7 +90,7 @@ export function createMemoRoutes(deps: AppDeps) {
         }
       } else if (visRaw?.length) {
         visibilityIn = visRaw;
-      } else if (auth.role !== "ADMIN") {
+      } else {
         viewerUsername = auth.username;
       }
 
@@ -133,12 +133,6 @@ export function createMemoRoutes(deps: AppDeps) {
           offset,
           state,
           visibility: "PUBLIC",
-        });
-      } else if (auth.role === "ADMIN") {
-        rows = await repo.listMemosTopLevel({
-          limit: pageSize,
-          offset,
-          state,
         });
       } else {
         rows = await repo.listMemosTopLevel({
@@ -224,10 +218,13 @@ export function createMemoRoutes(deps: AppDeps) {
     if (row.state === "ARCHIVED") {
       if (
         !auth ||
-        (auth.role !== "ADMIN" && auth.username !== row.creator_username)
+        auth.username !== row.creator_username
       ) {
         return jsonError(c, GrpcCode.NOT_FOUND, "memo not found");
       }
+    }
+    if (row.visibility !== "PUBLIC" && !auth) {
+      return jsonError(c, GrpcCode.UNAUTHENTICATED, "user not authenticated");
     }
     if (!canViewMemo(row, auth)) {
       return jsonError(c, GrpcCode.PERMISSION_DENIED, "permission denied");

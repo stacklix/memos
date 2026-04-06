@@ -4,6 +4,7 @@ import {
   LibraryIcon,
   LucideIcon,
   Settings2Icon,
+  ShieldCheckIcon,
   TagsIcon,
   UserIcon,
   UsersIcon,
@@ -19,6 +20,7 @@ import MyAccountSection from "@/components/Settings/MyAccountSection";
 import PreferencesSection from "@/components/Settings/PreferencesSection";
 import SectionMenuItem from "@/components/Settings/SectionMenuItem";
 import StorageSection from "@/components/Settings/StorageSection";
+import SSOSection from "@/components/Settings/SSOSection";
 import TagsSection from "@/components/Settings/TagsSection";
 import WebhookSection from "@/components/Settings/WebhookSection";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
@@ -29,10 +31,19 @@ import { InstanceSetting_Key } from "@/types/proto/api/v1/instance_service_pb";
 import { User_Role } from "@/types/proto/api/v1/user_service_pb";
 import { useTranslate } from "@/utils/i18n";
 
-type SettingSection = "my-account" | "preference" | "webhook" | "member" | "system" | "memo" | "storage" | "tags";
+type SettingSection =
+  | "my-account"
+  | "preference"
+  | "webhook"
+  | "member"
+  | "system"
+  | "memo"
+  | "storage"
+  | "tags"
+  | "sso";
 
 const BASIC_SECTIONS: SettingSection[] = ["my-account", "preference", "webhook"];
-const ADMIN_SECTIONS: SettingSection[] = ["member", "system", "memo", "tags", "storage"];
+const ADMIN_SECTIONS: SettingSection[] = ["member", "system", "memo", "tags", "storage", "sso"];
 const LAST_SETTING_SECTION_STORAGE_KEY = "memos:last-setting-section";
 
 const SECTION_ICON_MAP: Record<SettingSection, LucideIcon> = {
@@ -44,6 +55,7 @@ const SECTION_ICON_MAP: Record<SettingSection, LucideIcon> = {
   memo: LibraryIcon,
   storage: DatabaseIcon,
   tags: TagsIcon,
+  sso: ShieldCheckIcon,
 };
 
 const SECTION_COMPONENT_MAP: Record<SettingSection, React.ComponentType> = {
@@ -55,6 +67,7 @@ const SECTION_COMPONENT_MAP: Record<SettingSection, React.ComponentType> = {
   memo: MemoRelatedSettings,
   storage: StorageSection,
   tags: TagsSection,
+  sso: SSOSection,
 };
 
 const Setting = () => {
