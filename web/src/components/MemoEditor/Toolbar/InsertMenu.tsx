@@ -139,7 +139,6 @@ const InsertMenu = (props: InsertMenuProps) => {
           label: t("common.upload"),
           icon: FileIcon,
           onClick: handleUploadClick,
-          notImplemented: true,
         },
         {
           key: "link",
@@ -158,7 +157,6 @@ const InsertMenu = (props: InsertMenuProps) => {
           label: t("editor.voice-recorder.trigger"),
           icon: MicIcon,
           onClick: () => props.onVoiceRecorderClick?.(),
-          notImplemented: true,
         },
       ] satisfies Array<{
         key: string;

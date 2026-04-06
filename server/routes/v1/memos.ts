@@ -4,9 +4,8 @@ import type { AppDeps } from "../../types/deps.js";
 import type { AuthPrincipal } from "../../types/auth.js";
 import { createRepository, type DbMemoRow } from "../../db/repository.js";
 import { GrpcCode, jsonError } from "../../lib/grpc-status.js";
-import { memoToJson } from "../../lib/serializers.js";
+import { attachmentToJson, memoToJson } from "../../lib/serializers.js";
 import { b64urlToUtf8, utf8ToB64url } from "../../lib/b64url.js";
-import { extractTags } from "../../services/markdown.js";
 import { normalizeMemoStateFromClient, normalizeMemoVisibilityFromClient } from "../../lib/memo-enums.js";
 import {
   parseMemoLocationForCreate,
@@ -19,6 +18,9 @@ import {
   memoRowMatchesFilter,
   parseMemoListFilter,
 } from "../../lib/memo-filter.js";
+import { parseAttachmentFilter } from "../../lib/attachment-filter.js";
+import { parseInstanceNotificationSetting } from "../../lib/instance-notification-setting.js";
+import { dispatchMemoCommentWebhooks } from "../../services/user-webhook-dispatch.js";
 
 function memoIdFromName(name: string): string | null {
   const p = name.startsWith("memos/") ? name.slice("memos/".length) : name;
@@ -40,6 +42,15 @@ function canViewMemo(
 export function createMemoRoutes(deps: AppDeps) {
   const r = new Hono<{ Variables: ApiVariables }>();
   const repo = createRepository(deps.sql);
+
+  async function memoToJsonWithAttachments(m: DbMemoRow) {
+    const attachments = await repo.listAttachments({
+      memoUid: m.id,
+      limit: 1000,
+      offset: 0,
+    });
+    return memoToJson(m, { attachments: attachments.map((a) => attachmentToJson(a)) });
+  }
 
   r.get("/", async (c) => {
     const auth = c.get("auth");
@@ -164,7 +175,7 @@ export function createMemoRoutes(deps: AppDeps) {
     }
 
     return c.json({
-      memos: rows.map((m) => memoToJson(m, { tags: extractTags(m.content) })),
+      memos: await Promise.all(rows.map((m) => memoToJsonWithAttachments(m))),
       nextPageToken: next,
     });
   });
@@ -200,7 +211,7 @@ export function createMemoRoutes(deps: AppDeps) {
       pinned: Boolean(m.pinned),
       location: locIn.value,
     });
-    return c.json(memoToJson(row, { tags: extractTags(row.content) }));
+    return c.json(memoToJson(row));
   });
 
   r.get("/:id", async (c) => {
@@ -210,10 +221,18 @@ export function createMemoRoutes(deps: AppDeps) {
     if (!row || row.parent_memo_id) {
       return jsonError(c, GrpcCode.NOT_FOUND, "memo not found");
     }
+    if (row.state === "ARCHIVED") {
+      if (
+        !auth ||
+        (auth.role !== "ADMIN" && auth.username !== row.creator_username)
+      ) {
+        return jsonError(c, GrpcCode.NOT_FOUND, "memo not found");
+      }
+    }
     if (!canViewMemo(row, auth)) {
       return jsonError(c, GrpcCode.PERMISSION_DENIED, "permission denied");
     }
-    return c.json(memoToJson(row, { tags: extractTags(row.content) }));
+    return c.json(await memoToJsonWithAttachments(row));
   });
 
   r.patch("/:id", async (c) => {
@@ -258,7 +277,7 @@ export function createMemoRoutes(deps: AppDeps) {
     });
     const next = await repo.getMemoById(id);
     if (!next) return jsonError(c, GrpcCode.NOT_FOUND, "memo not found");
-    return c.json(memoToJson(next, { tags: extractTags(next.content) }));
+    return c.json(await memoToJsonWithAttachments(next));
   });
 
   r.delete("/:id", async (c) => {
@@ -274,12 +293,68 @@ export function createMemoRoutes(deps: AppDeps) {
     return c.json({});
   });
 
-  r.get("/:id/attachments", (c) =>
-    jsonError(c, GrpcCode.UNIMPLEMENTED, "attachments are not implemented"),
-  );
-  r.patch("/:id/attachments", (c) =>
-    jsonError(c, GrpcCode.UNIMPLEMENTED, "attachments are not implemented"),
-  );
+  r.get("/:id/attachments", async (c) => {
+    const auth = c.get("auth");
+    const id = c.req.param("id");
+    const parent = await repo.getMemoById(id);
+    if (!parent || parent.parent_memo_id) {
+      return jsonError(c, GrpcCode.NOT_FOUND, "memo not found");
+    }
+    if (!canViewMemo(parent, auth)) {
+      return jsonError(c, GrpcCode.PERMISSION_DENIED, "permission denied");
+    }
+    const pageSize = Math.min(1000, Math.max(1, Number(c.req.query("pageSize") ?? 50)));
+    const token = c.req.query("pageToken");
+    const offset = token ? Number(token) : 0;
+    if (token && !Number.isFinite(offset)) {
+      return jsonError(c, GrpcCode.INVALID_ARGUMENT, "invalid page token");
+    }
+    const filter = c.req.query("filter") ?? "";
+    let parsedFilter: { unlinkedOnly?: boolean; linkedOnly?: boolean; memoUid?: string };
+    try {
+      parsedFilter = parseAttachmentFilter(filter);
+    } catch {
+      return jsonError(c, GrpcCode.INVALID_ARGUMENT, "invalid filter");
+    }
+    // Memo attachments endpoint is scoped by memo id; reject contradictory filter explicitly.
+    if (parsedFilter.unlinkedOnly) {
+      return c.json({ attachments: [], nextPageToken: "" });
+    }
+    if (parsedFilter.memoUid && parsedFilter.memoUid !== id) {
+      return c.json({ attachments: [], nextPageToken: "" });
+    }
+    const rows = await repo.listAttachments({
+      memoUid: id,
+      limit: pageSize,
+      offset: Number.isFinite(offset) ? offset : 0,
+      ...(parsedFilter.linkedOnly ? { linkedOnly: true } : {}),
+    });
+    return c.json({
+      attachments: rows.map((x) => attachmentToJson(x)),
+      nextPageToken:
+        rows.length === pageSize ? String((Number.isFinite(offset) ? offset : 0) + pageSize) : "",
+    });
+  });
+  r.patch("/:id/attachments", async (c) => {
+    const auth = c.get("auth");
+    if (!auth) return jsonError(c, GrpcCode.UNAUTHENTICATED, "permission denied");
+    const id = c.req.param("id");
+    const parent = await repo.getMemoById(id);
+    if (!parent || parent.parent_memo_id) {
+      return jsonError(c, GrpcCode.NOT_FOUND, "memo not found");
+    }
+    if (parent.creator_username !== auth.username && auth.role !== "ADMIN") {
+      return jsonError(c, GrpcCode.PERMISSION_DENIED, "permission denied");
+    }
+    type Body = { attachments?: { name?: string }[] };
+    const body = (await c.req.json()) as Body;
+    const attachmentIds =
+      body.attachments
+        ?.map((a) => a.name?.replace(/^attachments\//, ""))
+        .filter((x): x is string => Boolean(x)) ?? [];
+    await repo.setMemoAttachments(id, attachmentIds);
+    return c.json({});
+  });
 
   r.get("/:id/comments", async (c) => {
     const auth = c.get("auth");
@@ -293,7 +368,7 @@ export function createMemoRoutes(deps: AppDeps) {
     }
     const comments = await repo.listCommentsForMemo(id);
     return c.json({
-      memos: comments.map((m) => memoToJson(m, { tags: extractTags(m.content) })),
+      memos: await Promise.all(comments.map((m) => memoToJsonWithAttachments(m))),
       nextPageToken: "",
       totalSize: comments.length,
     });
@@ -336,7 +411,58 @@ export function createMemoRoutes(deps: AppDeps) {
       parentId: id,
       location: locIn.value,
     });
-    return c.json(memoToJson(row, { tags: extractTags(row.content) }));
+    if (
+      row.visibility !== "PRIVATE" &&
+      auth.username !== parent.creator_username
+    ) {
+      // Best-effort external delivery; inbox notification remains source of truth.
+      await dispatchMemoCommentWebhooks({
+        repo,
+        receiverUsername: parent.creator_username,
+        senderUsername: auth.username,
+        commentMemoUid: row.id,
+        relatedMemoUid: parent.id,
+      });
+      const receiver = await repo.getUser(parent.creator_username);
+      const receiverEmail = receiver?.email?.trim() ?? "";
+      if (receiverEmail) {
+        const notificationSetting = parseInstanceNotificationSetting(
+          await repo.getInstanceSettingRaw("NOTIFICATION"),
+        );
+        const emailSetting = notificationSetting.email;
+        if (
+          deps.sendNotificationEmail &&
+          emailSetting.enabled &&
+          emailSetting.smtpHost.trim() &&
+          emailSetting.smtpPort > 0 &&
+          emailSetting.fromEmail.trim()
+        ) {
+          const senderLabel = auth.username;
+          const subject = `[memos] New comment from ${senderLabel}`;
+          const text =
+            `${senderLabel} commented on your memo.\n\n` +
+            `Comment: ${deps.instanceUrl}/m/${row.id}\n` +
+            `Memo: ${deps.instanceUrl}/m/${parent.id}\n`;
+          await Promise.allSettled([
+            deps.sendNotificationEmail({
+              smtpHost: emailSetting.smtpHost,
+              smtpPort: emailSetting.smtpPort,
+              smtpUsername: emailSetting.smtpUsername,
+              smtpPassword: emailSetting.smtpPassword,
+              useTls: emailSetting.useTls,
+              useSsl: emailSetting.useSsl,
+              fromEmail: emailSetting.fromEmail,
+              fromName: emailSetting.fromName,
+              replyTo: emailSetting.replyTo,
+              to: receiverEmail,
+              subject,
+              text,
+            }),
+          ]);
+        }
+      }
+    }
+    return c.json(await memoToJsonWithAttachments(row));
   });
 
   r.get("/:id/reactions", async (c) => {
@@ -524,12 +650,20 @@ export function createMemoRoutes(deps: AppDeps) {
 export function createShareByTokenRoute(deps: AppDeps) {
   const r = new Hono<{ Variables: ApiVariables }>();
   const repo = createRepository(deps.sql);
+  async function memoToJsonWithAttachments(m: DbMemoRow) {
+    const attachments = await repo.listAttachments({
+      memoUid: m.id,
+      limit: 1000,
+      offset: 0,
+    });
+    return memoToJson(m, { attachments: attachments.map((a) => attachmentToJson(a)) });
+  }
   r.get("/:shareId", async (c) => {
     const memoId = await repo.getMemoIdByShareToken(c.req.param("shareId"));
     if (!memoId) return jsonError(c, GrpcCode.NOT_FOUND, "share not found");
     const row = await repo.getMemoById(memoId);
     if (!row) return jsonError(c, GrpcCode.NOT_FOUND, "memo not found");
-    return c.json(memoToJson(row, { tags: extractTags(row.content) }));
+    return c.json(await memoToJsonWithAttachments(row));
   });
   return r;
 }

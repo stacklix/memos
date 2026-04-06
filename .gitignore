@@ -3,5 +3,6 @@ data/
 dist/
 .wrangler/
 .dev.vars
+wrangler.local.jsonc
 *.log
 .DS_Store

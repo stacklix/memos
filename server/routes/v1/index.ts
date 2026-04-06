@@ -11,6 +11,7 @@ import { createAuthRoutes } from "./auth.js";
 import { createInstanceRoutes } from "./instance.js";
 import { createUserRoutes } from "./users.js";
 import { createMemoRoutes, createShareByTokenRoute } from "./memos.js";
+import { createAttachmentRoutes } from "./attachments.js";
 import { userStatsFieldsFromMemoRows } from "../../lib/user-stats-from-memos.js";
 
 export function createV1App(deps: AppDeps) {
@@ -30,8 +31,17 @@ export function createV1App(deps: AppDeps) {
       if (jwtSecret) {
         const access = await verifyAccessToken(token, jwtSecret);
         if (access) {
+          let username = access.username;
+          if (!username && access.userId != null) {
+            const u = await repo.getUserByInternalId(access.userId);
+            username = u?.username ?? null;
+          }
+          if (!username) {
+            await next();
+            return;
+          }
           c.set("auth", {
-            username: access.username,
+            username,
             role: access.role,
             via: "jwt",
           });
@@ -60,12 +70,6 @@ export function createV1App(deps: AppDeps) {
     return jsonError(c, GrpcCode.UNAUTHENTICATED, "permission denied");
   });
 
-  /**
-   * Not in golang v1 OpenAPI (`proto/gen/openapi.yaml`). Kept as public 404 so legacy probes fail cleanly
-   * and clients can use `GET /api/v1/instance/profile` (version, demo, admin) instead.
-   */
-  v1.get("/status", (c) => jsonError(c, GrpcCode.NOT_FOUND, "not found"));
-
   v1.get("/users:stats", async (c) => {
     const users = await repo.listUsers({ limit: 1000, offset: 0 });
     const auth = c.get("auth");
@@ -85,7 +89,7 @@ export function createV1App(deps: AppDeps) {
         pinnedMemos,
       } = userStatsFieldsFromMemoRows(rows, { useUpdateTimeForHeatmap });
       stats.push({
-        name: `users/${u.username}`,
+        name: `users/${u.username}/stats`,
         memoDisplayTimestamps,
         memoTypeStats,
         tagCount,
@@ -100,6 +104,7 @@ export function createV1App(deps: AppDeps) {
   v1.route("/instance", createInstanceRoutes(deps));
   v1.route("/users", createUserRoutes(deps));
   v1.route("/memos", createMemoRoutes(deps));
+  v1.route("/attachments", createAttachmentRoutes(deps));
   v1.route("/shares", createShareByTokenRoute(deps));
 
   return v1;

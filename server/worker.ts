@@ -1,6 +1,7 @@
 import { createApp } from "./app.js";
 import { createD1Adapter } from "./db/d1-adapter.js";
 import type { WorkerBindings } from "./types/bindings.js";
+import { sendNotificationEmailViaSmtp } from "./services/notification-email-node.js";
 
 /**
  * Cloudflare Worker: `/healthz` 与 `/api/*` 由 Hono 处理，其余交给 Static Assets（`dist/public/`，见 `wrangler.jsonc`）。
@@ -14,7 +15,9 @@ export default {
   ): Promise<Response> {
     const url = new URL(request.url);
     const handleApi =
-      url.pathname === "/healthz" || url.pathname.startsWith("/api/");
+      url.pathname === "/healthz" ||
+      url.pathname.startsWith("/api/") ||
+      url.pathname.startsWith("/file/");
     if (handleApi) {
       const sql = createD1Adapter(env.MEMOS_DB);
       const demo = env.MEMOS_DEMO === "1";
@@ -25,11 +28,26 @@ export default {
         instanceVersion: env.MEMOS_VERSION ?? "0.0.0",
         instanceUrl,
         debugHttp: env.MEMOS_DEBUG_HTTP === "1",
+        defaultAttachmentStorageType: "R2",
+        attachmentR2Bucket: env.MEMOS_ATTACHMENTS,
+        sendNotificationEmail: sendNotificationEmailViaSmtp,
       });
       return app.fetch(request, env, ctx);
     }
     const assetRes = await env.ASSETS.fetch(request);
     const pathname = url.pathname;
+    if (assetRes.status === 404) {
+      // SPA fallback: for client routes like /setting, serve index.html.
+      const isAssetPath = /\.[A-Za-z0-9]+$/.test(pathname);
+      if (!isAssetPath) {
+        const indexRes = await env.ASSETS.fetch(new URL("/", url));
+        const h = new Headers(indexRes.headers);
+        h.set("Cache-Control", "no-cache, no-store, must-revalidate");
+        h.set("Pragma", "no-cache");
+        h.set("Expires", "0");
+        return new Response(indexRes.body, { status: 200, headers: h });
+      }
+    }
     if (pathname === "/" || pathname === "/index.html") {
       const h = new Headers(assetRes.headers);
       h.set("Cache-Control", "no-cache, no-store, must-revalidate");

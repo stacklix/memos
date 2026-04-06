@@ -3,15 +3,22 @@
   "name": "memos",
   "main": "server/worker.ts",
   "compatibility_date": "2025-04-01",
+  "compatibility_flags": ["nodejs_compat"],
   // MEMOS_DEBUG_HTTP for local only: use `.dev.vars` (gitignored). `npm run dev:worker` runs scripts/ensure-wrangler-local-dev-vars.mjs — do not put MEMOS_DEBUG_HTTP in `vars` here or deploy would log bodies.
   // Worker API version (`instance/profile`, etc.); bump when releasing. Node still uses `package.json` / `MEMOS_VERSION` env.
   "vars": {
     "MEMOS_VERSION": "0.26.2"
   },
+  "r2_buckets": [
+    {
+      "binding": "MEMOS_ATTACHMENTS",
+      "bucket_name": "memos-attachments"
+    }
+  ],
   "d1_databases": [
     {
       "binding": "MEMOS_DB",
-      "database_name": "memos",
+      "database_name": "memos-db",
       "database_id": "00000000-0000-0000-0000-000000000001",
       "migrations_dir": "./migrations"
     }

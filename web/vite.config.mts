@@ -89,6 +89,10 @@ export default defineConfig({
         target: devProxyServer,
         xfwd: true,
       },
+      "^/file": {
+        target: devProxyServer,
+        xfwd: true,
+      },
     },
   },
   resolve: {

@@ -9,6 +9,7 @@ import { readRootPackageJsonVersion } from "./lib/root-package-version.js";
 import { createBetterSqliteAdapter } from "./db/better-sqlite-adapter.js";
 import { migrateBetterSqliteFromDir } from "./db/migrate.js";
 import { assertMigrationsDirReadable, resolveMigrationsDirectory } from "./lib/initial-migration-sql.js";
+import { sendNotificationEmailViaSmtp } from "./services/notification-email-node.js";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 
@@ -72,6 +73,9 @@ const inner = createApp({
   instanceVersion: process.env.MEMOS_VERSION ?? readRootPackageJsonVersion(__dirname),
   instanceUrl,
   debugHttp,
+  defaultAttachmentStorageType: "LOCAL",
+  attachmentDataDir: dataDir,
+  sendNotificationEmail: sendNotificationEmailViaSmtp,
 });
 if (debugHttp) {
   console.log(
@@ -83,7 +87,7 @@ const app = new Hono();
 
 app.all("*", async (c) => {
   const pathname = new URL(c.req.url).pathname;
-  if (pathname === "/healthz" || pathname.startsWith("/api/")) {
+  if (pathname === "/healthz" || pathname.startsWith("/api/") || pathname.startsWith("/file/")) {
     return inner.fetch(c.req.raw);
   }
 

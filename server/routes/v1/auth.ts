@@ -9,11 +9,9 @@ import { createRepository } from "../../db/repository.js";
 import { GrpcCode, jsonError } from "../../lib/grpc-status.js";
 import { verifyPassword } from "../../services/password.js";
 import { signAccessToken } from "../../services/jwt-access.js";
-import { randomTokenHex, sha256Hex } from "../../services/crypto-util.js";
+import { signRefreshToken, verifyRefreshToken } from "../../services/jwt-refresh.js";
 import { buildRefreshCookie, parseCookieHeader, REFRESH_COOKIE_NAME } from "../../lib/cookies.js";
-import { userToJson } from "../../lib/serializers.js";
-
-const REFRESH_DAYS = 30;
+import { authPrincipalFromUserRow, userToJson } from "../../lib/serializers.js";
 
 export function createAuthRoutes(deps: AppDeps) {
   const r = new Hono<{ Variables: ApiVariables }>();
@@ -26,7 +24,7 @@ export function createAuthRoutes(deps: AppDeps) {
     }
     const user = await repo.getUser(auth.username);
     if (!user) return jsonError(c, GrpcCode.UNAUTHENTICATED, "permission denied");
-    return c.json({ user: userToJson(user) });
+    return c.json({ user: userToJson(user, auth) });
   });
 
   r.post("/signin", async (c) => {
@@ -57,30 +55,37 @@ export function createAuthRoutes(deps: AppDeps) {
       return jsonError(c, GrpcCode.UNAUTHENTICATED, "invalid username or password");
     }
     const jwtSecret = deps.demo ? "usememos" : (await repo.getSecretKey())!;
+    const userId = await repo.getUserInternalId(user.username);
+    if (userId == null) {
+      return jsonError(c, GrpcCode.UNAUTHENTICATED, "invalid username or password");
+    }
     const { token, expiresAt } = await signAccessToken({
       secret: jwtSecret,
+      userId,
       username: user.username,
       role: user.role === "ADMIN" ? "ADMIN" : "USER",
+      status: user.state === "ARCHIVED" ? "ARCHIVED" : "NORMAL",
     });
-    const refreshRaw = randomTokenHex(32);
-    const refreshHash = await sha256Hex(refreshRaw);
-    const sessionId = crypto.randomUUID();
-    const exp = new Date();
-    exp.setDate(exp.getDate() + REFRESH_DAYS);
+    const tokenId = crypto.randomUUID();
+    const { token: refreshJwt, expiresAt: refreshExp } = await signRefreshToken({
+      secret: jwtSecret,
+      userId,
+      tokenId,
+    });
     await repo.addRefreshSession({
-      id: sessionId,
       username: user.username,
-      tokenHash: refreshHash,
-      expiresAt: exp.toISOString(),
+      tokenId,
+      expiresAt: refreshExp,
+      createdAt: new Date(),
     });
     const origin = c.req.header("origin") ?? "";
     const secure = origin.startsWith("https://");
     c.header(
       "Set-Cookie",
-      buildRefreshCookie(refreshRaw, exp, secure),
+      buildRefreshCookie(refreshJwt, refreshExp, secure),
     );
     return c.json({
-      user: userToJson(user),
+      user: userToJson(user, authPrincipalFromUserRow(user)),
       accessToken: token,
       accessTokenExpiresAt: expiresAt.toISOString().replace(/\.\d{3}Z$/, "Z"),
     });
@@ -93,10 +98,11 @@ export function createAuthRoutes(deps: AppDeps) {
     }
     const cookies = parseCookieHeader(c.req.header("cookie"));
     const raw = cookies[REFRESH_COOKIE_NAME];
-    if (raw) {
-      const h = await sha256Hex(raw);
-      const row = await repo.getRefreshByHash(h);
-      if (row) await repo.deleteRefreshSession(row.id);
+    const jwtSecret = deps.demo ? "usememos" : (await repo.getSecretKey())!;
+    const vr = raw ? await verifyRefreshToken(raw, jwtSecret) : null;
+    if (vr) {
+      const u = await repo.getUserByInternalId(vr.userId);
+      if (u) await repo.deleteRefreshToken(u.username, vr.tokenId);
     }
     await repo.deleteRefreshSessionsForUser(auth.username);
     const origin = c.req.header("origin") ?? "";
@@ -114,41 +120,48 @@ export function createAuthRoutes(deps: AppDeps) {
     if (!raw) {
       return jsonError(c, GrpcCode.UNAUTHENTICATED, "missing refresh token");
     }
-    const h = await sha256Hex(raw);
-    const row = await repo.getRefreshByHash(h);
-    if (!row) {
+    const jwtSecret = deps.demo ? "usememos" : (await repo.getSecretKey())!;
+    const vr = await verifyRefreshToken(raw, jwtSecret);
+    if (!vr) {
       return jsonError(c, GrpcCode.UNAUTHENTICATED, "invalid refresh token");
     }
-    if (new Date(row.expires_at).getTime() < Date.now()) {
-      await repo.deleteRefreshSession(row.id);
+    const rec = await repo.getRefreshTokenRecord(vr.userId, vr.tokenId);
+    if (!rec) {
+      return jsonError(c, GrpcCode.UNAUTHENTICATED, "invalid refresh token");
+    }
+    if (new Date(rec.expires_at_iso).getTime() < Date.now()) {
+      await repo.deleteRefreshToken(rec.username, vr.tokenId);
       return jsonError(c, GrpcCode.UNAUTHENTICATED, "refresh token expired");
     }
-    const user = await repo.getUser(row.username);
+    const user = await repo.getUser(rec.username);
     if (!user) {
       return jsonError(c, GrpcCode.UNAUTHENTICATED, "user not found");
     }
-    const jwtSecret = deps.demo ? "usememos" : (await repo.getSecretKey())!;
     const { token, expiresAt } = await signAccessToken({
       secret: jwtSecret,
+      userId: vr.userId,
       username: user.username,
       role: user.role === "ADMIN" ? "ADMIN" : "USER",
+      status: user.state === "ARCHIVED" ? "ARCHIVED" : "NORMAL",
     });
-    const newRefresh = randomTokenHex(32);
-    const newHash = await sha256Hex(newRefresh);
-    const newExp = new Date();
-    newExp.setDate(newExp.getDate() + REFRESH_DAYS);
-    await repo.deleteRefreshSession(row.id);
+    const newTokenId = crypto.randomUUID();
+    await repo.deleteRefreshToken(rec.username, vr.tokenId);
+    const { token: newRefreshJwt, expiresAt: newRefreshExp } = await signRefreshToken({
+      secret: jwtSecret,
+      userId: vr.userId,
+      tokenId: newTokenId,
+    });
     await repo.addRefreshSession({
-      id: crypto.randomUUID(),
-      username: user.username,
-      tokenHash: newHash,
-      expiresAt: newExp.toISOString(),
+      username: rec.username,
+      tokenId: newTokenId,
+      expiresAt: newRefreshExp,
+      createdAt: new Date(),
     });
     const origin = c.req.header("origin") ?? "";
     const secure = origin.startsWith("https://");
     c.header(
       "Set-Cookie",
-      buildRefreshCookie(newRefresh, newExp, secure),
+      buildRefreshCookie(newRefreshJwt, newRefreshExp, secure),
     );
     return c.json({
       accessToken: token,

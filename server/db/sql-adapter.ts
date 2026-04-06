@@ -1,4 +1,4 @@
-export type SqlPrimitive = string | number | bigint | null;
+export type SqlPrimitive = string | number | bigint | Uint8Array<ArrayBufferLike> | null;
 
 export type SqlRow = Record<string, SqlPrimitive>;
 

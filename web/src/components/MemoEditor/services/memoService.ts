@@ -78,8 +78,8 @@ export const memoService = {
     },
   ): Promise<{ memoName: string; hasChanges: boolean }> {
     // 1. Upload local files first
-    await uploadService.uploadFiles(state.localFiles);
-    const allAttachments = [...state.metadata.attachments];
+    const uploadedAttachments = await uploadService.uploadFiles(state.localFiles);
+    const allAttachments = [...state.metadata.attachments, ...uploadedAttachments];
 
     // 2. Update existing memo
     if (options.memoName) {
@@ -93,6 +93,10 @@ export const memoService = {
       const memo = await memoServiceClient.updateMemo({
         memo: create(MemoSchema, patch as Record<string, unknown>),
         updateMask: create(FieldMaskSchema, { paths: Array.from(mask) }),
+      });
+      await memoServiceClient.setMemoAttachments({
+        name: memo.name,
+        attachments: allAttachments,
       });
       return { memoName: memo.name, hasChanges: true };
     }
@@ -121,6 +125,13 @@ export const memoService = {
           comment: memoData,
         })
       : await memoServiceClient.createMemo({ memo: memoData });
+
+    if (allAttachments.length > 0) {
+      await memoServiceClient.setMemoAttachments({
+        name: memo.name,
+        attachments: allAttachments,
+      });
+    }
 
     return { memoName: memo.name, hasChanges: true };
   },

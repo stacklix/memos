@@ -1,6 +1,7 @@
 import { create } from "@bufbuild/protobuf";
 import { timestampFromDate } from "@bufbuild/protobuf/wkt";
 import { State } from "@/types/proto/api/v1/common_pb";
+import { AttachmentSchema } from "@/types/proto/api/v1/attachment_service_pb";
 import type { Memo } from "@/types/proto/api/v1/memo_service_pb";
 import { LocationSchema, MemoSchema, Visibility } from "@/types/proto/api/v1/memo_service_pb";
 import type { User } from "@/types/proto/api/v1/user_service_pb";
@@ -48,6 +49,22 @@ function locationFromApiJson(raw: unknown): Memo["location"] {
   return create(LocationSchema, { placeholder: ph, latitude: lat, longitude: lng });
 }
 
+function attachmentFromApiJson(raw: unknown) {
+  if (!raw || typeof raw !== "object") {
+    return create(AttachmentSchema, {});
+  }
+  const o = raw as Record<string, unknown>;
+  return create(AttachmentSchema, {
+    name: String(o.name ?? ""),
+    createTime: ts(o.createTime as string),
+    filename: String(o.filename ?? ""),
+    externalLink: String(o.externalLink ?? ""),
+    type: String(o.type ?? ""),
+    size: BigInt(String(o.size ?? "0")),
+    memo: o.memo ? String(o.memo) : undefined,
+  });
+}
+
 export function memoFromJson(j: Record<string, unknown>): Memo {
   return create(MemoSchema, {
     name: String(j.name ?? ""),
@@ -60,7 +77,7 @@ export function memoFromJson(j: Record<string, unknown>): Memo {
     visibility: visibilityFromApiJson(j.visibility),
     tags: (j.tags as string[]) ?? [],
     pinned: Boolean(j.pinned),
-    attachments: [],
+    attachments: Array.isArray(j.attachments) ? j.attachments.map((a) => attachmentFromApiJson(a)) : [],
     relations: (j.relations as Memo["relations"]) ?? [],
     reactions: (j.reactions as Memo["reactions"]) ?? [],
     property: j.property as Memo["property"],

@@ -60,8 +60,8 @@
 - `npm run db:clear:sqlite`：删除本地 **`memos.sqlite` 文件**（先停 `dev:node`）；下次启动 Node 会**自动**再迁移（需能定位 `0001_initial.sql`）。
 - `npm run dev:node`：本地 Node 后端（tsx watch，默认 **3000**）。
 - `npm run dev:web`：Vite 开发服务器（**3001**，代理 API 到 3000）。
-- `npm run db:migrate:d1:local`：仅对**本地** D1 应用 `migrations/`（`wrangler d1 migrations apply memos --local`）。
-- `npm run db:migrate:d1:remote`：对**远程** D1 应用迁移（生产前确认库名与账号；等价 `wrangler d1 migrations apply memos --remote`）。
+- `npm run db:migrate:d1:local`：仅对**本地** D1 应用 `migrations/`（`wrangler d1 migrations apply MEMOS_DB --local`）。
+- `npm run db:migrate:d1:remote`：对**远程** D1 应用迁移（生产前确认库名与账号；等价 `wrangler d1 migrations apply MEMOS_DB --remote`）。
 - `npm run db:empty:d1:local`：清空**本地** D1 业务表数据、保留表结构（`scripts/d1-empty-local-data.sql`）；先停 `wrangler dev`。
 - `npm run db:clear:d1:local`：删除 **`.wrangler/state`**（本地 D1 与其它 Wrangler 开发态持久化）；先停 `wrangler dev`；可加 `-- --yes`。
 - `npm run dev:worker`：若 `dist/public` 缺失或早于 `web/` 源码则先 `build:web`，再 **`npm run db:migrate:d1:local`**，再 Wrangler 本地 Worker。

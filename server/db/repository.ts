@@ -1,12 +1,67 @@
 import type { SqlAdapter, SqlPrimitive } from "./sql-adapter.js";
 import type { UserRole } from "../types/auth.js";
 import { randomTokenHex, sha256Hex } from "../services/crypto-util.js";
+import { deriveMemoProperty } from "../services/memo-content-props.js";
+import {
+  memoReactionContentId,
+  parseMemoPayloadGolang,
+  rebuildMemoPayloadFromContent,
+  stringifyMemoPayload,
+  type MemoPayloadGolang,
+} from "../lib/memo-payload.js";
+import {
+  newUserWebhookId,
+  parseWebhooksFromUserSettingValue,
+  serializeWebhooksUserSetting,
+  type StoredUserWebhook,
+} from "../lib/user-webhooks-setting.js";
+import {
+  parsePersonalAccessTokensUserSetting,
+  parseRefreshTokensUserSetting,
+  parseShortcutsUserSetting,
+  serializePersonalAccessTokensUserSetting,
+  serializeRefreshTokensUserSetting,
+  serializeShortcutsUserSetting,
+  USER_SETTING_KEY_PERSONAL_ACCESS_TOKENS,
+  USER_SETTING_KEY_REFRESH_TOKENS,
+  USER_SETTING_KEY_SHORTCUTS,
+} from "../lib/user-setting-auth-shortcuts.js";
 
 const DEFAULT_GENERAL = {
   disallowUserRegistration: false,
   disallowPasswordAuth: false,
 };
 
+/** Same string as golang `store.MemoRelationComment`. */
+const MEMO_RELATION_COMMENT = "COMMENT";
+
+function isoToUnixSec(iso: string): number {
+  return Math.floor(new Date(iso).getTime() / 1000);
+}
+
+function unixSecToIso(sec: number | bigint): string {
+  const n = typeof sec === "bigint" ? Number(sec) : sec;
+  return new Date(n * 1000).toISOString();
+}
+
+function parseMemoCommentFromInboxMessage(
+  message: string,
+): { memoId: number; relatedMemoId: number } | null {
+  try {
+    const j = JSON.parse(message) as Record<string, unknown>;
+    if (j.type !== "MEMO_COMMENT") return null;
+    const mc = (j.memoComment ?? j.memo_comment) as Record<string, unknown> | undefined;
+    if (!mc || typeof mc !== "object") return null;
+    const memoId = Number(mc.memoId ?? mc.memo_id);
+    const relatedMemoId = Number(mc.relatedMemoId ?? mc.related_memo_id);
+    if (!Number.isFinite(memoId) || !Number.isFinite(relatedMemoId)) return null;
+    return { memoId, relatedMemoId };
+  } catch {
+    return null;
+  }
+}
+
+/** Row shape used by routes / serializers (unchanged API surface). */
 export type DbUserRow = {
   username: string;
   password_hash: string;
@@ -19,6 +74,16 @@ export type DbUserRow = {
   create_time: string;
   update_time: string;
   deleted: number;
+};
+
+/** Inbox-backed notification row for API mapping (MEMO_COMMENT only). */
+export type DbUserNotificationRow = {
+  inbox_id: number;
+  sender_username: string;
+  create_time: string;
+  status: string;
+  comment_memo_uid: string | null;
+  related_memo_uid: string | null;
 };
 
 export type DbMemoRow = {
@@ -37,22 +102,240 @@ export type DbMemoRow = {
   location_placeholder: string | null;
   location_latitude: number | null;
   location_longitude: number | null;
+  /** From `memo.payload.tags` (golang `MemoPayload.tags`). */
+  payload_tags: string[];
+  /** From `memo.payload.property` when present. */
+  payload_property: ReturnType<typeof deriveMemoProperty> | null;
 };
 
+export type DbAttachmentRow = {
+  id: string;
+  creator_username: string;
+  create_time: string;
+  update_time: string;
+  filename: string;
+  blob: Uint8Array<ArrayBufferLike> | null;
+  type: string;
+  size: number;
+  memo_id: string | null;
+  storage_type: string;
+  reference: string;
+  payload: string;
+};
+
+type SqlUserRow = {
+  id: number;
+  username: string;
+  password_hash: string;
+  role: string;
+  email: string;
+  nickname: string;
+  avatar_url: string;
+  description: string;
+  row_status: string;
+  created_ts: number | bigint;
+  updated_ts: number | bigint;
+};
+
+function mapUserRow(r: SqlUserRow): DbUserRow {
+  return {
+    username: r.username,
+    password_hash: r.password_hash,
+    role: r.role,
+    display_name: r.nickname || null,
+    email: r.email || null,
+    avatar_url: r.avatar_url || null,
+    description: r.description || null,
+    state: r.row_status,
+    create_time: unixSecToIso(r.created_ts),
+    update_time: unixSecToIso(r.updated_ts),
+    deleted: r.row_status === "ARCHIVED" ? 1 : 0,
+  };
+}
+
+type SqlMemoRow = {
+  uid: string;
+  content: string;
+  visibility: string;
+  row_status: string;
+  pinned: number;
+  created_ts: number | bigint;
+  updated_ts: number | bigint;
+  payload: string;
+  creator_username: string;
+  parent_uid?: string | null;
+};
+
+type SqlAttachmentRow = {
+  uid: string;
+  creator_username: string;
+  created_ts: number | bigint;
+  updated_ts: number | bigint;
+  filename: string;
+  blob: Uint8Array<ArrayBufferLike> | null;
+  type: string;
+  size: number;
+  memo_uid: string | null;
+  storage_type: string;
+  reference: string;
+  payload: string;
+};
+
+/**
+ * golang: `memo.payload` is `memos.store.MemoPayload` JSON; display time in API comes from
+ * `created_ts` / `updated_ts` per instance MEMO_RELATED (see `memo_service_converter.go`).
+ */
+function mapMemoRow(r: SqlMemoRow, displayWithUpdateTime: boolean): DbMemoRow {
+  const pl = parseMemoPayloadGolang(r.payload);
+  const loc = pl.location;
+  const displayTs = displayWithUpdateTime ? r.updated_ts : r.created_ts;
+  const snippet = r.content.slice(0, 200);
+  const apiState = r.row_status === "ARCHIVED" ? "ARCHIVED" : "NORMAL";
+  const pp = pl.property;
+  const payloadProperty =
+    pp &&
+    typeof pp.hasLink === "boolean" &&
+    typeof pp.hasTaskList === "boolean" &&
+    typeof pp.hasCode === "boolean" &&
+    typeof pp.hasIncompleteTasks === "boolean"
+      ? {
+          hasLink: pp.hasLink,
+          hasTaskList: pp.hasTaskList,
+          hasCode: pp.hasCode,
+          hasIncompleteTasks: pp.hasIncompleteTasks,
+          title: pp.title ?? "",
+        }
+      : null;
+  return {
+    id: r.uid,
+    creator_username: r.creator_username,
+    content: r.content,
+    visibility: r.visibility,
+    state: apiState,
+    pinned: r.pinned,
+    create_time: unixSecToIso(r.created_ts),
+    update_time: unixSecToIso(r.updated_ts),
+    display_time: unixSecToIso(displayTs),
+    snippet,
+    parent_memo_id: r.parent_uid ?? null,
+    deleted: r.row_status === "ARCHIVED" ? 1 : 0,
+    location_placeholder: loc?.placeholder ?? null,
+    location_latitude: loc?.latitude ?? null,
+    location_longitude: loc?.longitude ?? null,
+    payload_tags: pl.tags ?? [],
+    payload_property: payloadProperty,
+  };
+}
+
+function mapAttachmentRow(r: SqlAttachmentRow): DbAttachmentRow {
+  return {
+    id: r.uid,
+    creator_username: r.creator_username,
+    create_time: unixSecToIso(r.created_ts),
+    update_time: unixSecToIso(r.updated_ts),
+    filename: r.filename,
+    blob: r.blob ?? null,
+    type: r.type,
+    size: Number(r.size ?? 0),
+    memo_id: r.memo_uid ?? null,
+    storage_type: r.storage_type ?? "",
+    reference: r.reference ?? "",
+    payload: r.payload ?? "{}",
+  };
+}
+
 export function createRepository(sql: SqlAdapter) {
+  async function memoDisplayWithUpdateTime(): Promise<boolean> {
+    const row = await sql.queryOne<{ value: string }>(
+      "SELECT value FROM system_setting WHERE name = 'MEMO_RELATED'",
+    );
+    if (!row?.value) return false;
+    try {
+      const j = JSON.parse(row.value) as { displayWithUpdateTime?: boolean };
+      return Boolean(j.displayWithUpdateTime);
+    } catch {
+      return false;
+    }
+  }
+
+  async function resolveMemoInternalId(uid: string): Promise<number | null> {
+    const r = await sql.queryOne<{ id: number }>("SELECT id FROM memo WHERE uid = ?", [
+      uid,
+    ]);
+    return r?.id ?? null;
+  }
+
+  async function lookupMemoUidsForInternalIds(ids: number[]): Promise<Map<number, string>> {
+    const map = new Map<number, string>();
+    const uniq = [...new Set(ids)].filter((x) => Number.isFinite(x) && x > 0);
+    if (uniq.length === 0) return map;
+    const placeholders = uniq.map(() => "?").join(",");
+    const rows = await sql.queryAll<{ id: number; uid: string }>(
+      `SELECT id, uid FROM memo WHERE id IN (${placeholders})`,
+      uniq,
+    );
+    for (const r of rows) map.set(r.id, r.uid);
+    return map;
+  }
+
+  async function fetchMemoCommentNotificationForUser(
+    username: string,
+    inboxId: number,
+  ): Promise<DbUserNotificationRow | null> {
+    const row = await sql.queryOne<{
+      id: number;
+      created_ts: number | bigint;
+      status: string;
+      message: string;
+      sender_username: string;
+    }>(
+      `SELECT i.id, i.created_ts, i.status, i.message, su.username AS sender_username
+       FROM inbox i
+       INNER JOIN user ru ON ru.id = i.receiver_id AND ru.row_status = 'NORMAL'
+       INNER JOIN user su ON su.id = i.sender_id AND su.row_status = 'NORMAL'
+       WHERE ru.username = ? AND i.id = ?
+         AND json_extract(i.message, '$.type') = 'MEMO_COMMENT'`,
+      [username, inboxId],
+    );
+    if (!row) return null;
+    const p = parseMemoCommentFromInboxMessage(row.message);
+    if (!p) return null;
+    const uidMap = await lookupMemoUidsForInternalIds([p.memoId, p.relatedMemoId]);
+    return {
+      inbox_id: row.id,
+      sender_username: row.sender_username,
+      create_time: unixSecToIso(row.created_ts),
+      status: row.status,
+      comment_memo_uid: uidMap.get(p.memoId) ?? null,
+      related_memo_uid: uidMap.get(p.relatedMemoId) ?? null,
+    };
+  }
+
+  const memoSelectFields = `
+    m.uid, m.content, m.visibility, m.row_status, m.pinned, m.created_ts, m.updated_ts, m.payload,
+    u.username AS creator_username,
+    parent.uid AS parent_uid`;
+
+  const memoJoins = `
+    FROM memo m
+    INNER JOIN user u ON u.id = m.creator_id
+    LEFT JOIN memo_relation com ON com.memo_id = m.id AND com.type = '${MEMO_RELATION_COMMENT}'
+    LEFT JOIN memo parent ON parent.id = com.related_memo_id`;
+
   return {
     sql,
 
     async getSecretKey(): Promise<string | null> {
       const row = await sql.queryOne<{ value: string }>(
-        "SELECT value FROM instance_kv WHERE key = 'secret_key'",
+        "SELECT value FROM system_setting WHERE name = 'secret_key'",
       );
       return row?.value ?? null;
     },
 
     async setSecretKey(value: string): Promise<void> {
       await sql.execute(
-        "INSERT INTO instance_kv (key, value) VALUES ('secret_key', ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+        `INSERT INTO system_setting (name, value, description) VALUES ('secret_key', ?, '')
+         ON CONFLICT(name) DO UPDATE SET value = excluded.value`,
         [value],
       );
     },
@@ -66,12 +349,12 @@ export function createRepository(sql: SqlAdapter) {
     },
 
     async getGeneralSetting(): Promise<typeof DEFAULT_GENERAL> {
-      const row = await sql.queryOne<{ json_value: string }>(
-        "SELECT json_value FROM instance_settings WHERE setting_key = 'GENERAL'",
+      const row = await sql.queryOne<{ value: string }>(
+        "SELECT value FROM system_setting WHERE name = 'GENERAL'",
       );
       if (!row) return { ...DEFAULT_GENERAL };
       try {
-        const parsed = JSON.parse(row.json_value) as Record<string, unknown>;
+        const parsed = JSON.parse(row.value) as Record<string, unknown>;
         return {
           disallowUserRegistration: Boolean(
             parsed.disallowUserRegistration ?? parsed.disallow_user_registration,
@@ -95,29 +378,28 @@ export function createRepository(sql: SqlAdapter) {
         next.disallowPasswordAuth = patch.disallowPasswordAuth;
       }
       await sql.execute(
-        `INSERT INTO instance_settings (setting_key, json_value) VALUES ('GENERAL', ?)
-         ON CONFLICT(setting_key) DO UPDATE SET json_value = excluded.json_value`,
+        `INSERT INTO system_setting (name, value, description) VALUES ('GENERAL', ?, '')
+         ON CONFLICT(name) DO UPDATE SET value = excluded.value`,
         [JSON.stringify(next)],
       );
     },
 
     async getInstanceSettingRaw(key: string): Promise<string | null> {
-      const row = await sql.queryOne<{ json_value: string }>(
-        "SELECT json_value FROM instance_settings WHERE setting_key = ?",
+      const row = await sql.queryOne<{ value: string }>(
+        "SELECT value FROM system_setting WHERE name = ?",
         [key],
       );
-      return row?.json_value ?? null;
+      return row?.value ?? null;
     },
 
     async upsertInstanceSettingRaw(key: string, jsonValue: string): Promise<void> {
       await sql.execute(
-        `INSERT INTO instance_settings (setting_key, json_value) VALUES (?, ?)
-         ON CONFLICT(setting_key) DO UPDATE SET json_value = excluded.json_value`,
+        `INSERT INTO system_setting (name, value, description) VALUES (?, ?, '')
+         ON CONFLICT(name) DO UPDATE SET value = excluded.value`,
         [key, jsonValue],
       );
     },
 
-    /** From persisted MEMO_RELATED JSON; aligns user-stats heatmap with golang. */
     async getMemoRelatedDisplayWithUpdateTime(): Promise<boolean> {
       const raw = await this.getInstanceSettingRaw("MEMO_RELATED");
       if (!raw) return false;
@@ -131,22 +413,40 @@ export function createRepository(sql: SqlAdapter) {
 
     async userCount(): Promise<number> {
       const row = await sql.queryOne<{ c: number }>(
-        "SELECT COUNT(*) as c FROM users WHERE deleted = 0",
+        "SELECT COUNT(*) as c FROM user WHERE row_status = 'NORMAL'",
       );
       return row?.c ?? 0;
     },
 
     async findAdmin(): Promise<DbUserRow | null> {
-      return sql.queryOne<DbUserRow>(
-        "SELECT * FROM users WHERE deleted = 0 AND role = 'ADMIN' ORDER BY create_time ASC LIMIT 1",
+      const r = await sql.queryOne<SqlUserRow>(
+        "SELECT * FROM user WHERE row_status = 'NORMAL' AND role = 'ADMIN' ORDER BY created_ts ASC LIMIT 1",
       );
+      return r ? mapUserRow(r) : null;
     },
 
     async getUser(username: string): Promise<DbUserRow | null> {
-      return sql.queryOne<DbUserRow>(
-        "SELECT * FROM users WHERE username = ? AND deleted = 0",
+      const r = await sql.queryOne<SqlUserRow>(
+        "SELECT * FROM user WHERE username = ? AND row_status = 'NORMAL'",
         [username],
       );
+      return r ? mapUserRow(r) : null;
+    },
+
+    async getUserInternalId(username: string): Promise<number | null> {
+      const r = await sql.queryOne<{ id: number }>(
+        "SELECT id FROM user WHERE username = ? AND row_status = 'NORMAL'",
+        [username],
+      );
+      return r?.id ?? null;
+    },
+
+    async getUserByInternalId(id: number): Promise<DbUserRow | null> {
+      const r = await sql.queryOne<SqlUserRow>(
+        "SELECT * FROM user WHERE id = ? AND row_status = 'NORMAL'",
+        [id],
+      );
+      return r ? mapUserRow(r) : null;
     },
 
     async createUser(args: {
@@ -156,18 +456,15 @@ export function createRepository(sql: SqlAdapter) {
       displayName?: string;
       email?: string;
     }): Promise<DbUserRow> {
-      const now = new Date().toISOString();
       await sql.execute(
-        `INSERT INTO users (username, password_hash, role, display_name, email, state, create_time, update_time, deleted)
-         VALUES (?, ?, ?, ?, ?, 'NORMAL', ?, ?, 0)`,
+        `INSERT INTO user (username, password_hash, role, nickname, email, row_status)
+         VALUES (?, ?, ?, ?, ?, 'NORMAL')`,
         [
           args.username,
           args.passwordHash,
           args.role,
-          args.displayName ?? null,
-          args.email ?? null,
-          now,
-          now,
+          args.displayName ?? "",
+          args.email ?? "",
         ],
       );
       const u = await this.getUser(args.username);
@@ -176,10 +473,11 @@ export function createRepository(sql: SqlAdapter) {
     },
 
     async listUsers(args: { limit: number; offset: number }): Promise<DbUserRow[]> {
-      return sql.queryAll<DbUserRow>(
-        "SELECT * FROM users WHERE deleted = 0 ORDER BY create_time ASC LIMIT ? OFFSET ?",
+      const rows = await sql.queryAll<SqlUserRow>(
+        "SELECT * FROM user WHERE row_status = 'NORMAL' ORDER BY created_ts ASC LIMIT ? OFFSET ?",
         [args.limit, args.offset],
       );
+      return rows.map(mapUserRow);
     },
 
     async updateUser(
@@ -197,20 +495,20 @@ export function createRepository(sql: SqlAdapter) {
       const sets: string[] = [];
       const vals: SqlPrimitive[] = [];
       if (fields.display_name !== undefined) {
-        sets.push("display_name = ?");
-        vals.push(fields.display_name);
+        sets.push("nickname = ?");
+        vals.push(fields.display_name ?? "");
       }
       if (fields.email !== undefined) {
         sets.push("email = ?");
-        vals.push(fields.email);
+        vals.push(fields.email ?? "");
       }
       if (fields.avatar_url !== undefined) {
         sets.push("avatar_url = ?");
-        vals.push(fields.avatar_url);
+        vals.push(fields.avatar_url ?? "");
       }
       if (fields.description !== undefined) {
         sets.push("description = ?");
-        vals.push(fields.description);
+        vals.push(fields.description ?? "");
       }
       if (fields.password_hash !== undefined) {
         sets.push("password_hash = ?");
@@ -221,105 +519,146 @@ export function createRepository(sql: SqlAdapter) {
         vals.push(fields.role);
       }
       if (fields.state !== undefined) {
-        sets.push("state = ?");
+        sets.push("row_status = ?");
         vals.push(fields.state);
       }
-      sets.push("update_time = ?");
-      vals.push(new Date().toISOString());
+      sets.push("updated_ts = strftime('%s', 'now')");
       vals.push(username);
       if (sets.length === 1) return;
       await sql.execute(
-        `UPDATE users SET ${sets.join(", ")} WHERE username = ? AND deleted = 0`,
+        `UPDATE user SET ${sets.join(", ")} WHERE username = ? AND row_status = 'NORMAL'`,
         vals,
       );
     },
 
     async softDeleteUser(username: string): Promise<void> {
       await sql.execute(
-        "UPDATE users SET deleted = 1, update_time = ? WHERE username = ?",
-        [new Date().toISOString(), username],
+        "UPDATE user SET row_status = 'ARCHIVED', updated_ts = strftime('%s', 'now') WHERE username = ?",
+        [username],
       );
     },
 
     async addRefreshSession(args: {
-      id: string;
       username: string;
-      tokenHash: string;
-      expiresAt: string;
+      tokenId: string;
+      expiresAt: Date;
+      createdAt: Date;
     }): Promise<void> {
-      await sql.execute(
-        `INSERT INTO refresh_sessions (id, username, token_hash, expires_at, created_at)
-         VALUES (?, ?, ?, ?, ?)`,
-        [
-          args.id,
-          args.username,
-          args.tokenHash,
-          args.expiresAt,
-          new Date().toISOString(),
-        ],
+      const raw = await this.getUserSetting(args.username, USER_SETTING_KEY_REFRESH_TOKENS);
+      const doc = parseRefreshTokensUserSetting(raw);
+      doc.refreshTokens.push({
+        tokenId: args.tokenId,
+        expiresAt: args.expiresAt.toISOString(),
+        createdAt: args.createdAt.toISOString(),
+      });
+      await this.upsertUserSetting(
+        args.username,
+        USER_SETTING_KEY_REFRESH_TOKENS,
+        serializeRefreshTokensUserSetting(doc),
       );
     },
 
-    async getRefreshByHash(
-      tokenHash: string,
-    ): Promise<{ id: string; username: string; expires_at: string } | null> {
-      return sql.queryOne(
-        "SELECT id, username, expires_at FROM refresh_sessions WHERE token_hash = ?",
-        [tokenHash],
+    async getRefreshTokenRecord(
+      userId: number,
+      tokenId: string,
+    ): Promise<{ username: string; expires_at_iso: string } | null> {
+      const r = await sql.queryOne<{ username: string; value: string }>(
+        `SELECT u.username, s.value FROM user_setting s
+         INNER JOIN user u ON u.id = s.user_id AND u.row_status = 'NORMAL'
+         WHERE u.id = ? AND s.key = ?`,
+        [userId, USER_SETTING_KEY_REFRESH_TOKENS],
       );
+      if (!r) return null;
+      const doc = parseRefreshTokensUserSetting(r.value);
+      const t = doc.refreshTokens.find((x) => x.tokenId === tokenId);
+      if (!t) return null;
+      return { username: r.username, expires_at_iso: t.expiresAt };
     },
 
-    async deleteRefreshSession(id: string): Promise<void> {
-      await sql.execute("DELETE FROM refresh_sessions WHERE id = ?", [id]);
+    async deleteRefreshToken(username: string, tokenId: string): Promise<void> {
+      const raw = await this.getUserSetting(username, USER_SETTING_KEY_REFRESH_TOKENS);
+      const doc = parseRefreshTokensUserSetting(raw);
+      doc.refreshTokens = doc.refreshTokens.filter((x) => x.tokenId !== tokenId);
+      await this.upsertUserSetting(
+        username,
+        USER_SETTING_KEY_REFRESH_TOKENS,
+        serializeRefreshTokensUserSetting(doc),
+      );
     },
 
     async deleteRefreshSessionsForUser(username: string): Promise<void> {
-      await sql.execute("DELETE FROM refresh_sessions WHERE username = ?", [
+      await this.upsertUserSetting(
         username,
-      ]);
+        USER_SETTING_KEY_REFRESH_TOKENS,
+        serializeRefreshTokensUserSetting({ refreshTokens: [] }),
+      );
     },
 
     async listPats(username: string) {
-      return sql.queryAll<{
-        id: string;
-        description: string | null;
-        created_at: string;
-      }>(
-        "SELECT id, description, created_at FROM personal_access_tokens WHERE username = ? ORDER BY created_at DESC",
-        [username],
-      );
+      const raw = await this.getUserSetting(username, USER_SETTING_KEY_PERSONAL_ACCESS_TOKENS);
+      const doc = parsePersonalAccessTokensUserSetting(raw);
+      return [...doc.tokens]
+        .sort((a, b) => {
+          const ta = a.createdAt ? new Date(a.createdAt).getTime() : 0;
+          const tb = b.createdAt ? new Date(b.createdAt).getTime() : 0;
+          return tb - ta;
+        })
+        .map((t) => ({
+          id: t.tokenId,
+          description: t.description ?? null,
+          created_at: t.createdAt ?? "",
+        }));
     },
 
     async createPat(username: string, description: string | null) {
       const id = crypto.randomUUID();
       const raw = `memos_pat_${randomTokenHex(24)}`;
       const tokenHash = await sha256Hex(raw);
-      await sql.execute(
-        `INSERT INTO personal_access_tokens (id, username, description, token_hash, created_at)
-         VALUES (?, ?, ?, ?, ?)`,
-        [id, username, description, tokenHash, new Date().toISOString()],
+      const rawSetting = await this.getUserSetting(username, USER_SETTING_KEY_PERSONAL_ACCESS_TOKENS);
+      const doc = parsePersonalAccessTokensUserSetting(rawSetting);
+      doc.tokens.push({
+        tokenId: id,
+        tokenHash,
+        description: description ?? "",
+        createdAt: new Date().toISOString(),
+      });
+      await this.upsertUserSetting(
+        username,
+        USER_SETTING_KEY_PERSONAL_ACCESS_TOKENS,
+        serializePersonalAccessTokensUserSetting(doc),
       );
       return { id, raw };
     },
 
     async deletePat(username: string, patId: string): Promise<boolean> {
-      const r = await sql.execute(
-        "DELETE FROM personal_access_tokens WHERE id = ? AND username = ?",
-        [patId, username],
+      const rawSetting = await this.getUserSetting(username, USER_SETTING_KEY_PERSONAL_ACCESS_TOKENS);
+      const doc = parsePersonalAccessTokensUserSetting(rawSetting);
+      const before = doc.tokens.length;
+      doc.tokens = doc.tokens.filter((t) => t.tokenId !== patId);
+      if (doc.tokens.length === before) return false;
+      await this.upsertUserSetting(
+        username,
+        USER_SETTING_KEY_PERSONAL_ACCESS_TOKENS,
+        serializePersonalAccessTokensUserSetting(doc),
       );
-      return r.changes > 0;
+      return true;
     },
 
     async findUserByPat(rawToken: string): Promise<DbUserRow | null> {
       const tokenHash = await sha256Hex(rawToken);
-      const row = await sql.queryOne<{ username: string }>(
-        `SELECT t.username FROM personal_access_tokens t
-         INNER JOIN users u ON u.username = t.username AND u.deleted = 0
-         WHERE t.token_hash = ?`,
-        [tokenHash],
+      const r = await sql.queryOne<SqlUserRow>(
+        `SELECT u.* FROM user_setting s
+         INNER JOIN user u ON u.id = s.user_id AND u.row_status = 'NORMAL'
+         WHERE s.key = ?
+           AND EXISTS (
+             SELECT 1 FROM json_each(COALESCE(json_extract(s.value, '$.tokens'), json('[]'))) AS je
+             WHERE json_extract(je.value, '$.tokenHash') = ?
+                OR json_extract(je.value, '$.token_hash') = ?
+           )
+         LIMIT 1`,
+        [USER_SETTING_KEY_PERSONAL_ACCESS_TOKENS, tokenHash, tokenHash],
       );
-      if (!row) return null;
-      return this.getUser(row.username);
+      return r ? mapUserRow(r) : null;
     },
 
     async createMemo(args: {
@@ -336,43 +675,112 @@ export function createRepository(sql: SqlAdapter) {
         location_longitude: number;
       } | null;
     }): Promise<DbMemoRow> {
-      const now = new Date().toISOString();
-      const snippet = args.content.slice(0, 200);
-      const loc = args.location;
+      const creator = await sql.queryOne<{ id: number }>(
+        "SELECT id FROM user WHERE username = ? AND row_status = 'NORMAL'",
+        [args.creator],
+      );
+      if (!creator) throw new Error("creator not found");
+
+      const rowStatus = args.state === "ARCHIVED" ? "ARCHIVED" : "NORMAL";
+      const nowSec = Math.floor(Date.now() / 1000);
+      let createdTs = nowSec;
+      let updatedTs = nowSec;
+
+      const rebuilt = rebuildMemoPayloadFromContent(args.content);
+      const pl: MemoPayloadGolang = { ...rebuilt };
+      if (args.location) {
+        pl.location = {
+          placeholder: args.location.location_placeholder,
+          latitude: args.location.location_latitude,
+          longitude: args.location.location_longitude,
+        };
+      }
+
       await sql.execute(
-        `INSERT INTO memos (id, creator_username, content, visibility, state, pinned, create_time, update_time, display_time, snippet, parent_memo_id, location_placeholder, location_latitude, location_longitude, deleted)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0)`,
+        `INSERT INTO memo (uid, creator_id, content, visibility, row_status, pinned, payload, created_ts, updated_ts)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
         [
           args.id,
-          args.creator,
+          creator.id,
           args.content,
           args.visibility,
-          args.state,
+          rowStatus,
           args.pinned ? 1 : 0,
-          now,
-          now,
-          now,
-          snippet,
-          args.parentId ?? null,
-          loc?.location_placeholder ?? null,
-          loc?.location_latitude ?? null,
-          loc?.location_longitude ?? null,
+          stringifyMemoPayload(pl),
+          createdTs,
+          updatedTs,
         ],
       );
-      const m = await this.getMemoById(args.id);
-      if (!m) throw new Error("memo missing");
-      return m;
+
+      const newId = await resolveMemoInternalId(args.id);
+      if (newId == null) throw new Error("memo missing after insert");
+
+      let parentInternalId: number | null = null;
+      if (args.parentId) {
+        parentInternalId = await resolveMemoInternalId(args.parentId);
+        if (parentInternalId != null) {
+          await sql.execute(
+            `INSERT INTO memo_relation (memo_id, related_memo_id, type) VALUES (?, ?, ?)`,
+            [newId, parentInternalId, MEMO_RELATION_COMMENT],
+          );
+        }
+        const parentRow = await sql.queryOne<{ creator_id: number }>(
+          "SELECT creator_id FROM memo WHERE uid = ?",
+          [args.parentId],
+        );
+        const parentCreator = parentRow
+          ? await sql.queryOne<{ username: string }>(
+              "SELECT username FROM user WHERE id = ? AND row_status = 'NORMAL'",
+              [parentRow.creator_id],
+            )
+          : null;
+        if (
+          parentInternalId != null &&
+          parentCreator &&
+          args.creator !== parentCreator.username &&
+          args.visibility !== "PRIVATE"
+        ) {
+          const message = JSON.stringify({
+            type: "MEMO_COMMENT",
+            memoComment: { memoId: newId, relatedMemoId: parentInternalId },
+          });
+          const sender = await sql.queryOne<{ id: number }>(
+            "SELECT id FROM user WHERE username = ? AND row_status = 'NORMAL'",
+            [args.creator],
+          );
+          const receiver = await sql.queryOne<{ id: number }>(
+            "SELECT id FROM user WHERE username = ? AND row_status = 'NORMAL'",
+            [parentCreator.username],
+          );
+          if (sender && receiver) {
+            await sql.execute(
+              `INSERT INTO inbox (sender_id, receiver_id, status, message) VALUES (?, ?, 'UNREAD', ?)`,
+              [sender.id, receiver.id, message],
+            );
+          }
+        }
+      }
+
+      const dw = await memoDisplayWithUpdateTime();
+      const r = await sql.queryOne<SqlMemoRow>(
+        `SELECT ${memoSelectFields} ${memoJoins} WHERE m.uid = ?`,
+        [args.id],
+      );
+      if (!r) throw new Error("memo missing");
+      return mapMemoRow(r, dw);
     },
 
-    async getMemoById(id: string): Promise<DbMemoRow | null> {
-      return sql.queryOne<DbMemoRow>(
-        "SELECT * FROM memos WHERE id = ? AND deleted = 0",
-        [id],
+    async getMemoById(uid: string): Promise<DbMemoRow | null> {
+      const dw = await memoDisplayWithUpdateTime();
+      const r = await sql.queryOne<SqlMemoRow>(
+        `SELECT ${memoSelectFields} ${memoJoins} WHERE m.uid = ?`,
+        [uid],
       );
+      return r ? mapMemoRow(r, dw) : null;
     },
 
     async updateMemo(
-      id: string,
+      uid: string,
       patch: Partial<{
         content: string;
         visibility: string;
@@ -388,67 +796,101 @@ export function createRepository(sql: SqlAdapter) {
           | null;
       }>,
     ): Promise<void> {
+      const cur = await sql.queryOne<{
+        payload: string;
+        id: number;
+      }>("SELECT id, payload FROM memo WHERE uid = ?", [uid]);
+      if (!cur) return;
+      let pl = parseMemoPayloadGolang(cur.payload);
       const sets: string[] = [];
       const vals: SqlPrimitive[] = [];
       if (patch.content !== undefined) {
         sets.push("content = ?");
         vals.push(patch.content);
-        sets.push("snippet = ?");
-        vals.push(patch.content.slice(0, 200));
+        const rebuilt = rebuildMemoPayloadFromContent(patch.content);
+        pl = { ...rebuilt, location: pl.location };
       }
       if (patch.visibility !== undefined) {
         sets.push("visibility = ?");
         vals.push(patch.visibility);
       }
-      if (patch.state !== undefined) {
-        sets.push("state = ?");
-        vals.push(patch.state);
-      }
       if (patch.pinned !== undefined) {
         sets.push("pinned = ?");
         vals.push(patch.pinned ? 1 : 0);
       }
+      if (patch.state !== undefined) {
+        sets.push("row_status = ?");
+        vals.push(patch.state === "ARCHIVED" ? "ARCHIVED" : "NORMAL");
+      }
+      let displayWroteUpdatedTs = false;
       if (patch.display_time !== undefined) {
-        sets.push("display_time = ?");
-        vals.push(patch.display_time);
+        const useUpd = await memoDisplayWithUpdateTime();
+        const sec =
+          patch.display_time != null && patch.display_time !== ""
+            ? isoToUnixSec(patch.display_time)
+            : null;
+        if (sec != null) {
+          if (useUpd) {
+            sets.push("updated_ts = ?");
+            vals.push(sec);
+            displayWroteUpdatedTs = true;
+          } else {
+            sets.push("created_ts = ?");
+            vals.push(sec);
+          }
+        }
       }
       if (patch.location !== undefined) {
         if (patch.location === null) {
-          sets.push("location_placeholder = ?");
-          vals.push(null);
-          sets.push("location_latitude = ?");
-          vals.push(null);
-          sets.push("location_longitude = ?");
-          vals.push(null);
+          const { location: _l, ...rest } = pl;
+          pl = rest;
         } else {
-          sets.push("location_placeholder = ?");
-          vals.push(patch.location.location_placeholder);
-          sets.push("location_latitude = ?");
-          vals.push(patch.location.location_latitude);
-          sets.push("location_longitude = ?");
-          vals.push(patch.location.location_longitude);
+          pl = {
+            ...pl,
+            location: {
+              placeholder: patch.location.location_placeholder,
+              latitude: patch.location.location_latitude,
+              longitude: patch.location.location_longitude,
+            },
+          };
         }
       }
-      sets.push("update_time = ?");
-      vals.push(new Date().toISOString());
-      vals.push(id);
-      await sql.execute(`UPDATE memos SET ${sets.join(", ")} WHERE id = ? AND deleted = 0`, vals);
+      if (
+        patch.content !== undefined ||
+        patch.location !== undefined
+      ) {
+        sets.push("payload = ?");
+        vals.push(stringifyMemoPayload(pl));
+      }
+      if (!displayWroteUpdatedTs) {
+        sets.push("updated_ts = strftime('%s', 'now')");
+      }
+      vals.push(uid);
+      if (sets.length === 0) return;
+      await sql.execute(`UPDATE memo SET ${sets.join(", ")} WHERE uid = ?`, vals);
     },
 
-    async softDeleteMemo(id: string): Promise<void> {
+    /** Hard delete (aligns with golang `DeleteMemo`). */
+    async softDeleteMemo(uid: string): Promise<void> {
+      const idRow = await sql.queryOne<{ id: number }>("SELECT id FROM memo WHERE uid = ?", [
+        uid,
+      ]);
+      if (!idRow) return;
+      const mid = idRow.id;
+      const cid = memoReactionContentId(uid);
+      await sql.execute("DELETE FROM reaction WHERE content_id = ? OR content_id = ?", [
+        cid,
+        uid,
+      ]);
       await sql.execute(
-        "UPDATE memos SET deleted = 1, update_time = ? WHERE id = ?",
-        [new Date().toISOString(), id],
+        "DELETE FROM memo_relation WHERE memo_id = ? OR related_memo_id = ?",
+        [mid, mid],
       );
+      await sql.execute("DELETE FROM memo WHERE id = ?", [mid]);
     },
 
-    /**
-     * Top-level NORMAL memos for user-stats (tags, activity heatmap), with visibility rules
-     * aligned with golang GetUserStats: self sees all; others see PUBLIC+PROTECTED; anonymous PUBLIC only.
-     */
     async listTopLevelMemosForUserStats(args: {
       creatorUsername: string;
-      /** `null` = unauthenticated caller */
       viewerUsername: string | null;
     }): Promise<
       Array<{
@@ -461,22 +903,39 @@ export function createRepository(sql: SqlAdapter) {
       }>
     > {
       const where: string[] = [
-        "deleted = 0",
-        "parent_memo_id IS NULL",
-        "state = 'NORMAL'",
-        "creator_username = ?",
+        "m.row_status = 'NORMAL'",
+        `NOT EXISTS (SELECT 1 FROM memo_relation c WHERE c.memo_id = m.id AND c.type = '${MEMO_RELATION_COMMENT}')`,
+        "u.username = ?",
       ];
       const vals: SqlPrimitive[] = [args.creatorUsername];
       const v = args.viewerUsername;
       if (v === null) {
-        where.push("visibility = 'PUBLIC'");
+        where.push("m.visibility = 'PUBLIC'");
       } else if (v !== args.creatorUsername) {
-        where.push("(visibility = 'PUBLIC' OR visibility = 'PROTECTED')");
+        where.push("(m.visibility = 'PUBLIC' OR m.visibility = 'PROTECTED')");
       }
-      return sql.queryAll(
-        `SELECT id, content, display_time, create_time, update_time, pinned FROM memos WHERE ${where.join(" AND ")}`,
+      const dw = await memoDisplayWithUpdateTime();
+      const rows = await sql.queryAll<{
+        uid: string;
+        content: string;
+        created_ts: number | bigint;
+        updated_ts: number | bigint;
+        pinned: number;
+      }>(
+        `SELECT m.uid, m.content, m.created_ts, m.updated_ts, m.pinned
+         FROM memo m
+         INNER JOIN user u ON u.id = m.creator_id
+         WHERE ${where.join(" AND ")}`,
         vals,
       );
+      return rows.map((m) => ({
+        id: m.uid,
+        content: m.content,
+        display_time: unixSecToIso(dw ? m.updated_ts : m.created_ts),
+        create_time: unixSecToIso(m.created_ts),
+        update_time: unixSecToIso(m.updated_ts),
+        pinned: m.pinned,
+      }));
     },
 
     async listMemosTopLevel(args: {
@@ -485,83 +944,110 @@ export function createRepository(sql: SqlAdapter) {
       state: string;
       visibility?: string | null;
       creator?: string | null;
-      /** Logged-in non-admin: public, protected, or own private. */
       viewerUsername?: string | null;
-      /** Extra visibility constraint (e.g. explore: PUBLIC+PROTECTED). */
       visibilityIn?: string[] | null;
       pinnedOnly?: boolean;
       timeField?: "create_time" | "update_time";
       timeStartSec?: number;
       timeEndSec?: number;
     }): Promise<DbMemoRow[]> {
-      const where: string[] = ["deleted = 0", "parent_memo_id IS NULL"];
-      const vals: SqlPrimitive[] = [];
-      where.push("state = ?");
-      vals.push(args.state);
+      const rowStatus = args.state === "ARCHIVED" ? "ARCHIVED" : "NORMAL";
+      const where: string[] = [
+        "m.row_status = ?",
+        `NOT EXISTS (SELECT 1 FROM memo_relation c WHERE c.memo_id = m.id AND c.type = '${MEMO_RELATION_COMMENT}')`,
+      ];
+      const vals: SqlPrimitive[] = [rowStatus];
       if (args.visibility) {
-        where.push("visibility = ?");
+        where.push("m.visibility = ?");
         vals.push(args.visibility);
       }
       if (args.creator) {
-        where.push("creator_username = ?");
+        where.push("u.username = ?");
         vals.push(args.creator);
       }
       if (args.viewerUsername) {
         where.push(
-          "(visibility = 'PUBLIC' OR visibility = 'PROTECTED' OR (visibility = 'PRIVATE' AND creator_username = ?))",
+          "(m.visibility = 'PUBLIC' OR m.visibility = 'PROTECTED' OR (m.visibility = 'PRIVATE' AND u.username = ?))",
         );
         vals.push(args.viewerUsername);
       }
       if (args.visibilityIn && args.visibilityIn.length > 0) {
         const ph = args.visibilityIn.map(() => "?").join(", ");
-        where.push(`visibility IN (${ph})`);
+        where.push(`m.visibility IN (${ph})`);
         for (const v of args.visibilityIn) vals.push(v);
       }
       if (args.pinnedOnly) {
-        where.push("pinned = 1");
+        where.push("m.pinned = 1");
       }
       if (
         args.timeField &&
         args.timeStartSec !== undefined &&
         args.timeEndSec !== undefined
       ) {
-        where.push(
-          `(strftime('%s', ${args.timeField}) + 0) >= ? AND (strftime('%s', ${args.timeField}) + 0) < ?`,
-        );
+        const col = args.timeField === "update_time" ? "m.updated_ts" : "m.created_ts";
+        where.push(`(${col} + 0) >= ? AND (${col} + 0) < ?`);
         vals.push(args.timeStartSec, args.timeEndSec);
       }
       vals.push(args.limit, args.offset);
-      return sql.queryAll<DbMemoRow>(
-        `SELECT * FROM memos WHERE ${where.join(" AND ")} ORDER BY pinned DESC, display_time DESC, create_time DESC LIMIT ? OFFSET ?`,
+      const dw = await memoDisplayWithUpdateTime();
+      const orderTs = dw ? "m.updated_ts" : "m.created_ts";
+      const rows = await sql.queryAll<SqlMemoRow>(
+        `SELECT ${memoSelectFields} ${memoJoins}
+         WHERE ${where.join(" AND ")}
+         ORDER BY m.pinned DESC, ${orderTs} DESC, m.id DESC
+         LIMIT ? OFFSET ?`,
         vals,
       );
+      return rows.map((r) => mapMemoRow(r, dw));
     },
 
-    async listCommentsForMemo(parentId: string): Promise<DbMemoRow[]> {
-      return sql.queryAll<DbMemoRow>(
-        "SELECT * FROM memos WHERE parent_memo_id = ? AND deleted = 0 ORDER BY create_time ASC",
-        [parentId],
+    async listCommentsForMemo(parentUid: string): Promise<DbMemoRow[]> {
+      const dw = await memoDisplayWithUpdateTime();
+      const rows = await sql.queryAll<SqlMemoRow>(
+        `SELECT ${memoSelectFields} ${memoJoins}
+         WHERE m.row_status = 'NORMAL'
+         AND EXISTS (
+           SELECT 1 FROM memo_relation r
+           WHERE r.memo_id = m.id AND r.type = '${MEMO_RELATION_COMMENT}'
+           AND r.related_memo_id = (SELECT id FROM memo WHERE uid = ?)
+         )
+         ORDER BY m.created_ts ASC`,
+        [parentUid],
       );
+      return rows.map((r) => mapMemoRow(r, dw));
     },
 
-    async setMemoRelations(memoId: string, pairs: { relatedId: string; type: string }[]) {
-      await sql.execute("DELETE FROM memo_relations WHERE memo_id = ?", [memoId]);
+    async setMemoRelations(memoUid: string, pairs: { relatedId: string; type: string }[]) {
+      const mid = await resolveMemoInternalId(memoUid);
+      if (mid == null) return;
+      await sql.execute(
+        `DELETE FROM memo_relation WHERE memo_id = ? AND type != '${MEMO_RELATION_COMMENT}'`,
+        [mid],
+      );
       for (const p of pairs) {
+        const rid = await resolveMemoInternalId(p.relatedId);
+        if (rid == null) continue;
         await sql.execute(
-          `INSERT INTO memo_relations (memo_id, related_memo_id, relation_type) VALUES (?, ?, ?)`,
-          [memoId, p.relatedId, p.type],
+          `INSERT INTO memo_relation (memo_id, related_memo_id, type) VALUES (?, ?, ?)`,
+          [mid, rid, p.type],
         );
       }
     },
 
-    async listMemoRelations(memoId: string) {
-      return sql.queryAll<{
-        related_memo_id: string;
-        relation_type: string;
-      }>(
-        "SELECT related_memo_id, relation_type FROM memo_relations WHERE memo_id = ?",
-        [memoId],
+    async listMemoRelations(memoUid: string) {
+      const mid = await resolveMemoInternalId(memoUid);
+      if (mid == null) return [];
+      const rows = await sql.queryAll<{ related_uid: string; relation_type: string }>(
+        `SELECT r2.uid AS related_uid, mr.type AS relation_type
+         FROM memo_relation mr
+         INNER JOIN memo r2 ON r2.id = mr.related_memo_id AND r2.row_status = 'NORMAL'
+         WHERE mr.memo_id = ? AND mr.type != '${MEMO_RELATION_COMMENT}'`,
+        [mid],
       );
+      return rows.map((x) => ({
+        related_memo_id: x.related_uid,
+        relation_type: x.relation_type,
+      }));
     },
 
     async upsertReaction(args: {
@@ -570,95 +1056,289 @@ export function createRepository(sql: SqlAdapter) {
       creator: string;
       reactionType: string;
     }) {
-      const now = new Date().toISOString();
+      const creator = await sql.queryOne<{ id: number }>(
+        "SELECT id FROM user WHERE username = ? AND row_status = 'NORMAL'",
+        [args.creator],
+      );
+      if (!creator) throw new Error("user not found");
+      const contentId = memoReactionContentId(args.memoId);
       await sql.execute(
-        "DELETE FROM memo_reactions WHERE memo_id = ? AND creator_username = ? AND reaction_type = ?",
-        [args.memoId, args.creator, args.reactionType],
+        "DELETE FROM reaction WHERE content_id IN (?, ?) AND creator_id = ? AND reaction_type = ?",
+        [contentId, args.memoId, creator.id, args.reactionType],
       );
       await sql.execute(
-        `INSERT INTO memo_reactions (id, memo_id, creator_username, reaction_type, create_time)
-         VALUES (?, ?, ?, ?, ?)`,
-        [args.id, args.memoId, args.creator, args.reactionType, now],
+        `INSERT INTO reaction (created_ts, creator_id, content_id, reaction_type)
+         VALUES (strftime('%s', 'now'), ?, ?, ?)`,
+        [creator.id, contentId, args.reactionType],
       );
     },
 
-    async listReactions(memoId: string) {
-      return sql.queryAll<{
-        id: string;
+    async listReactions(memoUid: string) {
+      const contentId = memoReactionContentId(memoUid);
+      const rows = await sql.queryAll<{
+        id: number;
         creator_username: string;
         reaction_type: string;
-        create_time: string;
+        created_ts: number | bigint;
       }>(
-        "SELECT id, creator_username, reaction_type, create_time FROM memo_reactions WHERE memo_id = ? ORDER BY create_time ASC",
-        [memoId],
+        `SELECT r.id, u.username AS creator_username, r.reaction_type, r.created_ts
+         FROM reaction r
+         INNER JOIN user u ON u.id = r.creator_id
+         WHERE r.content_id IN (?, ?)
+         ORDER BY r.created_ts ASC`,
+        [contentId, memoUid],
       );
+      return rows.map((r) => ({
+        id: String(r.id),
+        creator_username: r.creator_username,
+        reaction_type: r.reaction_type,
+        create_time: unixSecToIso(r.created_ts),
+      }));
     },
 
-    async deleteReaction(memoId: string, reactionId: string): Promise<boolean> {
+    async deleteReaction(memoUid: string, reactionId: string): Promise<boolean> {
+      const contentId = memoReactionContentId(memoUid);
       const r = await sql.execute(
-        "DELETE FROM memo_reactions WHERE id = ? AND memo_id = ?",
-        [reactionId, memoId],
+        "DELETE FROM reaction WHERE id = ? AND content_id IN (?, ?)",
+        [reactionId, contentId, memoUid],
       );
       return r.changes > 0;
     },
 
-    async createShare(args: { id: string; memoId: string; token: string; expiresAt: string | null }) {
+    async createShare(args: {
+      id: string;
+      memoId: string;
+      token: string;
+      expiresAt: string | null;
+    }) {
+      const memo = await sql.queryOne<{ id: number }>(
+        "SELECT id FROM memo WHERE uid = ? AND row_status = 'NORMAL'",
+        [args.memoId],
+      );
+      if (!memo) throw new Error("memo not found");
+      const mrow = await sql.queryOne<{ creator_id: number }>(
+        "SELECT creator_id FROM memo WHERE id = ?",
+        [memo.id],
+      );
+      const expiresTs =
+        args.expiresAt && args.expiresAt.length > 0
+          ? isoToUnixSec(args.expiresAt)
+          : null;
       await sql.execute(
-        `INSERT INTO memo_shares (id, memo_id, share_token, expires_at, created_at) VALUES (?, ?, ?, ?, ?)`,
-        [
-          args.id,
-          args.memoId,
-          args.token,
-          args.expiresAt,
-          new Date().toISOString(),
-        ],
+        `INSERT INTO memo_share (uid, memo_id, creator_id, created_ts, expires_ts)
+         VALUES (?, ?, ?, strftime('%s', 'now'), ?)`,
+        [args.token, memo.id, mrow!.creator_id, expiresTs],
       );
     },
 
-    async listShares(memoId: string) {
-      return sql.queryAll<{
-        id: string;
+    async listShares(memoUid: string) {
+      const mid = await resolveMemoInternalId(memoUid);
+      if (mid == null) return [];
+      const rows = await sql.queryAll<{
         share_token: string;
-        expires_at: string | null;
-        created_at: string;
+        expires_ts: number | null;
+        created_ts: number | bigint;
       }>(
-        "SELECT id, share_token, expires_at, created_at FROM memo_shares WHERE memo_id = ? ORDER BY created_at DESC",
-        [memoId],
+        `SELECT uid AS share_token, expires_ts, created_ts
+         FROM memo_share WHERE memo_id = ? ORDER BY created_ts DESC`,
+        [mid],
       );
+      return rows.map((s) => ({
+        id: s.share_token,
+        share_token: s.share_token,
+        expires_at:
+          s.expires_ts != null ? unixSecToIso(s.expires_ts) : null,
+        created_at: unixSecToIso(s.created_ts),
+      }));
     },
 
-    async deleteShareByName(memoId: string, shareSegment: string): Promise<boolean> {
+    async deleteShareByName(memoUid: string, shareSegment: string): Promise<boolean> {
+      const mid = await resolveMemoInternalId(memoUid);
+      if (mid == null) return false;
       const r = await sql.execute(
-        "DELETE FROM memo_shares WHERE memo_id = ? AND (share_token = ? OR id = ?)",
-        [memoId, shareSegment, shareSegment],
+        `DELETE FROM memo_share WHERE memo_id = ? AND (uid = ? OR CAST(id AS TEXT) = ?)`,
+        [mid, shareSegment, shareSegment],
       );
       return r.changes > 0;
     },
 
     async getMemoIdByShareToken(token: string): Promise<string | null> {
-      const row = await sql.queryOne<{ memo_id: string; expires_at: string | null }>(
-        "SELECT memo_id, expires_at FROM memo_shares WHERE share_token = ?",
+      const row = await sql.queryOne<{
+        memo_uid: string;
+        expires_ts: number | null;
+      }>(
+        `SELECT m.uid AS memo_uid, s.expires_ts
+         FROM memo_share s
+         INNER JOIN memo m ON m.id = s.memo_id AND m.row_status = 'NORMAL'
+         WHERE s.uid = ?`,
         [token],
       );
       if (!row) return null;
-      if (row.expires_at) {
-        const ex = new Date(row.expires_at).getTime();
+      if (row.expires_ts != null) {
+        const ex = row.expires_ts * 1000;
         if (ex < Date.now()) return null;
       }
-      return row.memo_id;
+      return row.memo_uid;
+    },
+
+    async createAttachment(args: {
+      id: string;
+      creator: string;
+      filename: string;
+      content: Uint8Array<ArrayBufferLike> | null;
+      type: string;
+      size: number;
+      memoUid?: string | null;
+      storageType?: string;
+      reference?: string;
+      payload?: string;
+    }): Promise<DbAttachmentRow> {
+      const creator = await sql.queryOne<{ id: number }>(
+        "SELECT id FROM user WHERE username = ? AND row_status = 'NORMAL'",
+        [args.creator],
+      );
+      if (!creator) throw new Error("creator not found");
+      let memoId: number | null = null;
+      if (args.memoUid) {
+        memoId = await resolveMemoInternalId(args.memoUid);
+      }
+      await sql.execute(
+        `INSERT INTO attachment (uid, creator_id, filename, blob, type, size, memo_id, storage_type, reference, payload)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        [
+          args.id,
+          creator.id,
+          args.filename,
+          args.content,
+          args.type,
+          args.size,
+          memoId,
+          args.storageType ?? "DB",
+          args.reference ?? "",
+          args.payload ?? "{}",
+        ],
+      );
+      const row = await sql.queryOne<SqlAttachmentRow>(
+        `SELECT a.uid, u.username AS creator_username, a.created_ts, a.updated_ts, a.filename, a.blob, a.type, a.size,
+                m.uid AS memo_uid, a.storage_type, a.reference, a.payload
+         FROM attachment a
+         INNER JOIN user u ON u.id = a.creator_id
+         LEFT JOIN memo m ON m.id = a.memo_id
+         WHERE a.uid = ?`,
+        [args.id],
+      );
+      if (!row) throw new Error("attachment missing after insert");
+      return mapAttachmentRow(row);
+    },
+
+    async listAttachments(args: {
+      creatorUsername?: string;
+      memoUid?: string | null;
+      unlinkedOnly?: boolean;
+      linkedOnly?: boolean;
+      limit: number;
+      offset: number;
+    }): Promise<DbAttachmentRow[]> {
+      const where: string[] = [];
+      const vals: SqlPrimitive[] = [];
+      if (args.creatorUsername) {
+        where.push("u.username = ?");
+        vals.push(args.creatorUsername);
+      }
+      if (args.memoUid !== undefined && args.memoUid !== null) {
+        where.push("m.uid = ?");
+        vals.push(args.memoUid);
+      }
+      if (args.unlinkedOnly) {
+        where.push("a.memo_id IS NULL");
+      }
+      if (args.linkedOnly) {
+        where.push("a.memo_id IS NOT NULL");
+      }
+      vals.push(args.limit, args.offset);
+      const rows = await sql.queryAll<SqlAttachmentRow>(
+        `SELECT a.uid, u.username AS creator_username, a.created_ts, a.updated_ts, a.filename, a.blob, a.type, a.size,
+                m.uid AS memo_uid, a.storage_type, a.reference, a.payload
+         FROM attachment a
+         INNER JOIN user u ON u.id = a.creator_id
+         LEFT JOIN memo m ON m.id = a.memo_id
+         ${where.length > 0 ? `WHERE ${where.join(" AND ")}` : ""}
+         ORDER BY a.created_ts DESC, a.id DESC
+         LIMIT ? OFFSET ?`,
+        vals,
+      );
+      return rows.map(mapAttachmentRow);
+    },
+
+    async getAttachmentByUid(uid: string): Promise<DbAttachmentRow | null> {
+      const row = await sql.queryOne<SqlAttachmentRow>(
+        `SELECT a.uid, u.username AS creator_username, a.created_ts, a.updated_ts, a.filename, a.blob, a.type, a.size,
+                m.uid AS memo_uid, a.storage_type, a.reference, a.payload
+         FROM attachment a
+         INNER JOIN user u ON u.id = a.creator_id
+         LEFT JOIN memo m ON m.id = a.memo_id
+         WHERE a.uid = ?`,
+        [uid],
+      );
+      return row ? mapAttachmentRow(row) : null;
+    },
+
+    async updateAttachment(
+      uid: string,
+      patch: Partial<{
+        filename: string;
+        memoUid: string | null;
+      }>,
+    ): Promise<void> {
+      const sets: string[] = [];
+      const vals: SqlPrimitive[] = [];
+      if (patch.filename !== undefined) {
+        sets.push("filename = ?");
+        vals.push(patch.filename);
+      }
+      if (patch.memoUid !== undefined) {
+        const mid = patch.memoUid ? await resolveMemoInternalId(patch.memoUid) : null;
+        sets.push("memo_id = ?");
+        vals.push(mid);
+      }
+      if (sets.length === 0) return;
+      sets.push("updated_ts = strftime('%s', 'now')");
+      vals.push(uid);
+      await sql.execute(`UPDATE attachment SET ${sets.join(", ")} WHERE uid = ?`, vals);
+    },
+
+    async deleteAttachment(uid: string): Promise<boolean> {
+      const r = await sql.execute("DELETE FROM attachment WHERE uid = ?", [uid]);
+      return r.changes > 0;
+    },
+
+    async setMemoAttachments(memoUid: string, attachmentUids: string[]): Promise<void> {
+      const mid = await resolveMemoInternalId(memoUid);
+      if (mid == null) return;
+      await sql.execute("UPDATE attachment SET memo_id = NULL WHERE memo_id = ?", [mid]);
+      for (const uid of attachmentUids) {
+        await sql.execute("UPDATE attachment SET memo_id = ?, updated_ts = strftime('%s', 'now') WHERE uid = ?", [
+          mid,
+          uid,
+        ]);
+      }
     },
 
     async listShortcuts(username: string) {
-      return sql.queryAll<{
-        shortcut_id: string;
-        title: string;
-        filter_expr: string | null;
-        create_time: string;
-        update_time: string;
-      }>(
-        "SELECT shortcut_id, title, filter_expr, create_time, update_time FROM shortcuts WHERE username = ? ORDER BY create_time DESC",
-        [username],
-      );
+      const raw = await this.getUserSetting(username, USER_SETTING_KEY_SHORTCUTS);
+      const doc = parseShortcutsUserSetting(raw);
+      const t0 = Date.now();
+      const list = [...doc.shortcuts].reverse();
+      return list.map((s, i) => {
+        const iso = new Date(t0 - i * 1000).toISOString();
+        return {
+          shortcut_id: s.id,
+          title: s.title,
+          filter_expr: s.filter || null,
+          create_time: iso,
+          update_time: iso,
+        };
+      });
     },
 
     async createShortcut(args: {
@@ -667,11 +1347,17 @@ export function createRepository(sql: SqlAdapter) {
       title: string;
       filter: string | null;
     }) {
-      const now = new Date().toISOString();
-      await sql.execute(
-        `INSERT INTO shortcuts (shortcut_id, username, title, filter_expr, create_time, update_time)
-         VALUES (?, ?, ?, ?, ?, ?)`,
-        [args.shortcutId, args.username, args.title, args.filter, now, now],
+      const raw = await this.getUserSetting(args.username, USER_SETTING_KEY_SHORTCUTS);
+      const doc = parseShortcutsUserSetting(raw);
+      doc.shortcuts.push({
+        id: args.shortcutId,
+        title: args.title,
+        filter: args.filter ?? "",
+      });
+      await this.upsertUserSetting(
+        args.username,
+        USER_SETTING_KEY_SHORTCUTS,
+        serializeShortcutsUserSetting(doc),
       );
     },
 
@@ -680,137 +1366,180 @@ export function createRepository(sql: SqlAdapter) {
       shortcutId: string,
       patch: { title?: string; filter?: string | null },
     ) {
-      const sets: string[] = [];
-      const vals: SqlPrimitive[] = [];
-      if (patch.title !== undefined) {
-        sets.push("title = ?");
-        vals.push(patch.title);
-      }
-      if (patch.filter !== undefined) {
-        sets.push("filter_expr = ?");
-        vals.push(patch.filter);
-      }
-      sets.push("update_time = ?");
-      vals.push(new Date().toISOString());
-      vals.push(username, shortcutId);
-      if (sets.length === 1) return;
-      await sql.execute(
-        `UPDATE shortcuts SET ${sets.join(", ")} WHERE username = ? AND shortcut_id = ?`,
-        vals,
+      if (patch.title === undefined && patch.filter === undefined) return;
+      const raw = await this.getUserSetting(username, USER_SETTING_KEY_SHORTCUTS);
+      const doc = parseShortcutsUserSetting(raw);
+      const s = doc.shortcuts.find((x) => x.id === shortcutId);
+      if (!s) return;
+      if (patch.title !== undefined) s.title = patch.title;
+      if (patch.filter !== undefined) s.filter = patch.filter ?? "";
+      await this.upsertUserSetting(
+        username,
+        USER_SETTING_KEY_SHORTCUTS,
+        serializeShortcutsUserSetting(doc),
       );
     },
 
     async deleteShortcut(username: string, shortcutId: string): Promise<boolean> {
-      const r = await sql.execute(
-        "DELETE FROM shortcuts WHERE username = ? AND shortcut_id = ?",
-        [username, shortcutId],
+      const raw = await this.getUserSetting(username, USER_SETTING_KEY_SHORTCUTS);
+      const doc = parseShortcutsUserSetting(raw);
+      const before = doc.shortcuts.length;
+      doc.shortcuts = doc.shortcuts.filter((x) => x.id !== shortcutId);
+      if (doc.shortcuts.length === before) return false;
+      await this.upsertUserSetting(
+        username,
+        USER_SETTING_KEY_SHORTCUTS,
+        serializeShortcutsUserSetting(doc),
       );
-      return r.changes > 0;
+      return true;
     },
 
     async getUserSetting(username: string, key: string): Promise<string | null> {
-      const row = await sql.queryOne<{ json_value: string }>(
-        "SELECT json_value FROM user_settings_kv WHERE username = ? AND setting_key = ?",
+      const row = await sql.queryOne<{ value: string }>(
+        `SELECT s.value FROM user_setting s
+         INNER JOIN user u ON u.id = s.user_id AND u.row_status = 'NORMAL'
+         WHERE u.username = ? AND s.key = ?`,
         [username, key],
       );
-      return row?.json_value ?? null;
+      return row?.value ?? null;
     },
 
     async upsertUserSetting(username: string, key: string, json: string): Promise<void> {
       await sql.execute(
-        `INSERT INTO user_settings_kv (username, setting_key, json_value) VALUES (?, ?, ?)
-         ON CONFLICT(username, setting_key) DO UPDATE SET json_value = excluded.json_value`,
-        [username, key, json],
+        `INSERT INTO user_setting (user_id, key, value)
+         SELECT id, ?, ? FROM user WHERE username = ? AND row_status = 'NORMAL'
+         ON CONFLICT(user_id, key) DO UPDATE SET value = excluded.value`,
+        [key, json, username],
       );
     },
 
     async listUserSettings(username: string) {
       return sql.queryAll<{ setting_key: string; json_value: string }>(
-        "SELECT setting_key, json_value FROM user_settings_kv WHERE username = ?",
+        `SELECT s.key AS setting_key, s.value AS json_value FROM user_setting s
+         INNER JOIN user u ON u.id = s.user_id AND u.row_status = 'NORMAL'
+         WHERE u.username = ?`,
         [username],
       );
     },
 
-    async listWebhooks(username: string) {
-      return sql.queryAll<{
-        id: string;
-        url: string;
-        payload_json: string | null;
-        created_at: string;
-      }>(
-        "SELECT id, url, payload_json, created_at FROM user_webhooks WHERE username = ? ORDER BY created_at DESC",
-        [username],
-      );
+    async listWebhooks(username: string): Promise<StoredUserWebhook[]> {
+      const raw = await this.getUserSetting(username, "WEBHOOKS");
+      return parseWebhooksFromUserSettingValue(raw);
     },
 
-    async createWebhook(username: string, url: string) {
-      const id = crypto.randomUUID();
-      await sql.execute(
-        `INSERT INTO user_webhooks (id, username, url, created_at) VALUES (?, ?, ?, ?)`,
-        [id, username, url, new Date().toISOString()],
-      );
+    async createWebhook(username: string, url: string, displayName?: string): Promise<string> {
+      const id = newUserWebhookId();
+      const items = parseWebhooksFromUserSettingValue(await this.getUserSetting(username, "WEBHOOKS"));
+      items.push({ id, title: displayName?.trim() ?? "", url });
+      await this.upsertUserSetting(username, "WEBHOOKS", serializeWebhooksUserSetting(items));
       return id;
     },
 
-    async deleteWebhook(username: string, id: string): Promise<boolean> {
-      const r = await sql.execute(
-        "DELETE FROM user_webhooks WHERE id = ? AND username = ?",
-        [id, username],
-      );
-      return r.changes > 0;
+    async updateWebhook(
+      username: string,
+      webhookId: string,
+      patch: { url?: string; displayName?: string },
+      paths: Set<string>,
+    ): Promise<boolean> {
+      const items = parseWebhooksFromUserSettingValue(await this.getUserSetting(username, "WEBHOOKS"));
+      const idx = items.findIndex((w) => w.id === webhookId);
+      if (idx < 0) return false;
+      const cur = items[idx]!;
+      let next = { ...cur };
+      if (paths.size === 0) {
+        if (patch.url !== undefined && patch.url.trim() !== "") {
+          next.url = patch.url.trim();
+        }
+        if (patch.displayName !== undefined) {
+          next.title = patch.displayName;
+        }
+      } else {
+        for (const p of paths) {
+          if (p === "url" && patch.url !== undefined && patch.url.trim() !== "") {
+            next.url = patch.url.trim();
+          }
+          if (
+            (p === "display_name" || p === "displayName") &&
+            patch.displayName !== undefined
+          ) {
+            next.title = patch.displayName;
+          }
+        }
+      }
+      items[idx] = next;
+      await this.upsertUserSetting(username, "WEBHOOKS", serializeWebhooksUserSetting(items));
+      return true;
     },
 
-    async listNotifications(username: string) {
-      return sql.queryAll<{
-        id: string;
+    async deleteWebhook(username: string, id: string): Promise<boolean> {
+      const items = parseWebhooksFromUserSettingValue(await this.getUserSetting(username, "WEBHOOKS"));
+      const next = items.filter((w) => w.id !== id);
+      if (next.length === items.length) return false;
+      await this.upsertUserSetting(username, "WEBHOOKS", serializeWebhooksUserSetting(next));
+      return true;
+    },
+
+    async listNotifications(username: string): Promise<DbUserNotificationRow[]> {
+      const rows = await sql.queryAll<{
+        id: number;
+        created_ts: number | bigint;
         status: string;
-        payload_json: string;
-        create_time: string;
-        update_time: string;
+        message: string;
+        sender_username: string;
       }>(
-        "SELECT id, status, payload_json, create_time, update_time FROM user_notifications WHERE username = ? ORDER BY create_time DESC",
+        `SELECT i.id, i.created_ts, i.status, i.message, su.username AS sender_username
+         FROM inbox i
+         INNER JOIN user ru ON ru.id = i.receiver_id AND ru.row_status = 'NORMAL'
+         INNER JOIN user su ON su.id = i.sender_id AND su.row_status = 'NORMAL'
+         WHERE ru.username = ?
+           AND json_extract(i.message, '$.type') = 'MEMO_COMMENT'
+         ORDER BY i.created_ts DESC`,
         [username],
       );
+      const parsed: Array<{
+        row: (typeof rows)[0];
+        memoId: number;
+        relatedMemoId: number;
+      }> = [];
+      const idSet = new Set<number>();
+      for (const row of rows) {
+        const p = parseMemoCommentFromInboxMessage(row.message);
+        if (!p) continue;
+        parsed.push({ row, memoId: p.memoId, relatedMemoId: p.relatedMemoId });
+        idSet.add(p.memoId);
+        idSet.add(p.relatedMemoId);
+      }
+      const uidMap = await lookupMemoUidsForInternalIds([...idSet]);
+      return parsed.map(({ row, memoId, relatedMemoId }) => ({
+        inbox_id: row.id,
+        sender_username: row.sender_username,
+        create_time: unixSecToIso(row.created_ts),
+        status: row.status,
+        comment_memo_uid: uidMap.get(memoId) ?? null,
+        related_memo_uid: uidMap.get(relatedMemoId) ?? null,
+      }));
     },
 
-    async createNotification(args: {
-      id: string;
+    async updateNotificationStatus(args: {
       username: string;
-      status: string;
-      payload: string;
-    }): Promise<void> {
-      const now = new Date().toISOString();
-      await sql.execute(
-        `INSERT INTO user_notifications (id, username, status, payload_json, create_time, update_time)
-         VALUES (?, ?, ?, ?, ?, ?)`,
-        [args.id, args.username, args.status, args.payload, now, now],
+      inboxId: number;
+      status: "UNREAD" | "ARCHIVED";
+    }): Promise<DbUserNotificationRow | null> {
+      const r = await sql.execute(
+        `UPDATE inbox SET status = ?
+         WHERE id = ? AND receiver_id = (SELECT id FROM user WHERE username = ? AND row_status = 'NORMAL')
+           AND json_extract(message, '$.type') = 'MEMO_COMMENT'`,
+        [args.status, args.inboxId, args.username],
       );
+      if (r.changes === 0) return null;
+      return fetchMemoCommentNotificationForUser(args.username, args.inboxId);
     },
 
-    async updateNotification(args: {
-      id: string;
-      username: string;
-      status: string;
-      payload: string;
-    }): Promise<boolean> {
+    async deleteNotification(username: string, inboxId: number): Promise<boolean> {
       const r = await sql.execute(
-        `UPDATE user_notifications SET status = ?, payload_json = ?, update_time = ?
-         WHERE id = ? AND username = ?`,
-        [
-          args.status,
-          args.payload,
-          new Date().toISOString(),
-          args.id,
-          args.username,
-        ],
-      );
-      return r.changes > 0;
-    },
-
-    async deleteNotification(username: string, id: string): Promise<boolean> {
-      const r = await sql.execute(
-        "DELETE FROM user_notifications WHERE id = ? AND username = ?",
-        [id, username],
+        `DELETE FROM inbox WHERE id = ? AND receiver_id =
+         (SELECT id FROM user WHERE username = ? AND row_status = 'NORMAL')`,
+        [inboxId, username],
       );
       return r.changes > 0;
     },

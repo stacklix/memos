@@ -2,6 +2,7 @@
 export type WorkerBindings = {
   ASSETS: Fetcher;
   MEMOS_DB: D1Database;
+  MEMOS_ATTACHMENTS?: R2Bucket;
   /** Set to `"1"` to use fixed demo JWT secret (aligns with Go demo mode). */
   MEMOS_DEMO?: string;
   MEMOS_VERSION?: string;

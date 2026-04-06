@@ -1,17 +1,38 @@
-import type { DbMemoRow, DbUserRow } from "../db/repository.js";
+import type { DbAttachmentRow, DbMemoRow, DbUserRow } from "../db/repository.js";
+import type { AuthPrincipal } from "../types/auth.js";
 import { deriveMemoProperty } from "../services/memo-content-props.js";
+import { extractTags } from "../services/markdown.js";
 
 /** Proto JSON / picky clients (e.g. Swift OpenAPI date-time) often match this shape; see `auth/signin` accessTokenExpiresAt. */
 export function protoJsonTimestamp(iso: string): string {
   return iso.replace(/\.\d{1,9}Z$/, "Z");
 }
 
-export function userToJson(u: DbUserRow) {
+/** Viewer context for `userToJson` (matches golang `convertUserFromStore(user, viewer)`). */
+export function authPrincipalFromUserRow(u: DbUserRow): AuthPrincipal {
+  return {
+    username: u.username,
+    role: u.role === "ADMIN" ? "ADMIN" : "USER",
+    via: "jwt",
+  };
+}
+
+function canViewerSeeUserEmail(viewer: AuthPrincipal | null, target: DbUserRow): boolean {
+  if (!viewer) return false;
+  if (viewer.role === "ADMIN") return true;
+  return viewer.username === target.username;
+}
+
+/**
+ * JSON shape for `memos.api.v1.User`. Email is omitted from the payload for other users unless the viewer is ADMIN
+ * (same as golang `canViewerAccessUserEmail`).
+ */
+export function userToJson(u: DbUserRow, viewer: AuthPrincipal | null) {
   return {
     name: `users/${u.username}`,
     role: u.role === "ADMIN" ? "ADMIN" : "USER",
     username: u.username,
-    email: u.email ?? "",
+    email: canViewerSeeUserEmail(viewer, u) ? (u.email ?? "") : "",
     displayName: u.display_name ?? "",
     avatarUrl: u.avatar_url ?? "",
     description: u.description ?? "",
@@ -21,7 +42,10 @@ export function userToJson(u: DbUserRow) {
   };
 }
 
-export function memoToJson(m: DbMemoRow, extras?: { tags?: string[] }) {
+export function memoToJson(
+  m: DbMemoRow,
+  extras?: { tags?: string[]; attachments?: ReturnType<typeof attachmentToJson>[] },
+) {
   const lat = m.location_latitude;
   const lng = m.location_longitude;
   const ph = m.location_placeholder;
@@ -40,12 +64,14 @@ export function memoToJson(m: DbMemoRow, extras?: { tags?: string[] }) {
     displayTime: protoJsonTimestamp(m.display_time ?? m.create_time),
     content: m.content,
     visibility: m.visibility,
-    tags: extras?.tags ?? [],
+    tags:
+      extras?.tags ??
+      (m.payload_tags.length > 0 ? m.payload_tags : extractTags(m.content)),
     pinned: Boolean(m.pinned),
-    attachments: [],
+    attachments: extras?.attachments ?? [],
     relations: [],
     reactions: [],
-    property: deriveMemoProperty(m.content),
+    property: m.payload_property ?? deriveMemoProperty(m.content),
     snippet: m.snippet ?? "",
     parent: m.parent_memo_id ? `memos/${m.parent_memo_id}` : undefined,
     ...(hasLocation
@@ -57,5 +83,20 @@ export function memoToJson(m: DbMemoRow, extras?: { tags?: string[] }) {
           },
         }
       : {}),
+  };
+}
+
+export function attachmentToJson(a: DbAttachmentRow) {
+  const isExternalLink = /^https?:\/\//i.test(a.reference);
+  return {
+    name: `attachments/${a.id}`,
+    createTime: protoJsonTimestamp(a.create_time),
+    filename: a.filename,
+    // Only expose externalLink for true remote URLs.
+    // Internal storage references (e.g. "attachments/ab/uid.png") must be served via `/file/*`.
+    externalLink: isExternalLink ? a.reference : "",
+    type: a.type,
+    size: String(a.size),
+    memo: a.memo_id ? `memos/${a.memo_id}` : undefined,
   };
 }

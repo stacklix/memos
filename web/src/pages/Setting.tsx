@@ -33,6 +33,7 @@ type SettingSection = "my-account" | "preference" | "webhook" | "member" | "syst
 
 const BASIC_SECTIONS: SettingSection[] = ["my-account", "preference", "webhook"];
 const ADMIN_SECTIONS: SettingSection[] = ["member", "system", "memo", "tags", "storage"];
+const LAST_SETTING_SECTION_STORAGE_KEY = "memos:last-setting-section";
 
 const SECTION_ICON_MAP: Record<SettingSection, LucideIcon> = {
   "my-account": UserIcon,
@@ -71,8 +72,16 @@ const Setting = () => {
 
   useEffect(() => {
     const hash = location.hash.slice(1) as SettingSection;
-    const nextSection = settingsSectionList.includes(hash) ? hash : "my-account";
+    const saved = localStorage.getItem(LAST_SETTING_SECTION_STORAGE_KEY) as SettingSection | null;
+    const savedSection = saved && settingsSectionList.includes(saved) ? saved : null;
+    const nextSection = settingsSectionList.includes(hash)
+      ? hash
+      : (savedSection ?? "my-account");
     setSelectedSection(nextSection);
+    localStorage.setItem(LAST_SETTING_SECTION_STORAGE_KEY, nextSection);
+    if (!location.hash && nextSection) {
+      window.history.replaceState(null, "", `${location.pathname}#${nextSection}`);
+    }
   }, [location.hash, settingsSectionList]);
 
   useEffect(() => {
@@ -85,6 +94,7 @@ const Setting = () => {
   }, [isHost, fetchSetting]);
 
   const handleSectionSelectorItemClick = (section: SettingSection) => {
+    localStorage.setItem(LAST_SETTING_SECTION_STORAGE_KEY, section);
     window.location.hash = section;
   };
 

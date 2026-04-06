@@ -11,6 +11,7 @@ import {
   InstanceSetting_MemoRelatedSetting,
   InstanceSetting_MemoRelatedSettingSchema,
   InstanceSetting_StorageSetting,
+  InstanceSetting_StorageSetting_StorageType,
   InstanceSetting_StorageSettingSchema,
   InstanceSetting_TagsSetting,
   InstanceSetting_TagsSettingSchema,
@@ -38,11 +39,17 @@ interface InstanceContextValue extends InstanceState {
   generalSetting: InstanceSetting_GeneralSetting;
   memoRelatedSetting: InstanceSetting_MemoRelatedSetting;
   storageSetting: InstanceSetting_StorageSetting;
+  storageSupportedTypes: InstanceSetting_StorageSetting_StorageType[];
   tagsSetting: InstanceSetting_TagsSetting;
   initialize: () => Promise<void>;
   fetchSetting: (key: InstanceSetting_Key) => Promise<void>;
   updateSetting: (setting: InstanceSetting) => Promise<void>;
 }
+
+type InstanceSettingWithStorageMeta = InstanceSetting & {
+  __supportedStorageTypes?: InstanceSetting_StorageSetting_StorageType[];
+};
+const R2_STORAGE_TYPE = 4 as InstanceSetting_StorageSetting_StorageType;
 
 const InstanceContext = createContext<InstanceContextValue | null>(null);
 
@@ -78,6 +85,20 @@ export function InstanceProvider({ children }: { children: ReactNode }) {
       return setting.value.value;
     }
     return create(InstanceSetting_StorageSettingSchema, {});
+  }, [state.settings]);
+
+  const storageSupportedTypes = useMemo((): InstanceSetting_StorageSetting_StorageType[] => {
+    const setting = state.settings.find((s) => s.name === `${instanceSettingNamePrefix}STORAGE`) as
+      | InstanceSettingWithStorageMeta
+      | undefined;
+    return (
+      setting?.__supportedStorageTypes ?? [
+        InstanceSetting_StorageSetting_StorageType.DATABASE,
+        InstanceSetting_StorageSetting_StorageType.LOCAL,
+        InstanceSetting_StorageSetting_StorageType.S3,
+        R2_STORAGE_TYPE,
+      ]
+    );
   }, [state.settings]);
 
   const tagsSetting = useMemo((): InstanceSetting_TagsSetting => {
@@ -141,12 +162,23 @@ export function InstanceProvider({ children }: { children: ReactNode }) {
       generalSetting,
       memoRelatedSetting,
       storageSetting,
+      storageSupportedTypes,
       tagsSetting,
       initialize,
       fetchSetting,
       updateSetting,
     }),
-    [state, generalSetting, memoRelatedSetting, storageSetting, tagsSetting, initialize, fetchSetting, updateSetting],
+    [
+      state,
+      generalSetting,
+      memoRelatedSetting,
+      storageSetting,
+      storageSupportedTypes,
+      tagsSetting,
+      initialize,
+      fetchSetting,
+      updateSetting,
+    ],
   );
 
   return <InstanceContext.Provider value={value}>{children}</InstanceContext.Provider>;

@@ -25,6 +25,7 @@ function lazyWithReload<T extends React.ComponentType>(factory: () => Promise<{ 
 const Home = lazyWithReload(() => import("@/pages/Home"));
 const AdminSignIn = lazyWithReload(() => import("@/pages/AdminSignIn"));
 const Archived = lazyWithReload(() => import("@/pages/Archived"));
+const Attachments = lazyWithReload(() => import("@/pages/Attachments"));
 const Explore = lazyWithReload(() => import("@/pages/Explore"));
 const Inboxes = lazyWithReload(() => import("@/pages/Inboxes"));
 const MemoDetail = lazyWithReload(() => import("@/pages/MemoDetail"));
@@ -69,6 +70,7 @@ const router = createBrowserRouter([
             ],
           },
           { path: Routes.INBOX, element: <Inboxes /> },
+          { path: Routes.ATTACHMENTS, element: <Attachments /> },
           { path: Routes.SETTING, element: <Setting /> },
           { path: "memos/:uid", element: <MemoDetail /> },
           { path: "memos/shares/:token", element: <MemoDetail /> },

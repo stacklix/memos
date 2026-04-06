@@ -130,7 +130,9 @@ export function memoRowMatchesFilter(row: DbMemoRow, p: ParsedMemoListFilter): b
   }
 
   if (p.tagsIn?.length) {
-    const tags = new Set(extractTags(row.content));
+    const tags = new Set(
+      row.payload_tags.length > 0 ? row.payload_tags : extractTags(row.content),
+    );
     for (const t of p.tagsIn) {
       if (!tags.has(t)) return false;
     }

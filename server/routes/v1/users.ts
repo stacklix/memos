@@ -2,11 +2,16 @@ import { Hono } from "hono";
 import { z } from "zod";
 import type { ApiVariables } from "../../types/api-variables.js";
 import type { AppDeps } from "../../types/deps.js";
-import { createRepository } from "../../db/repository.js";
+import { createRepository, type DbUserNotificationRow } from "../../db/repository.js";
+import {
+  parseWebhooksFromUserSettingValue,
+  serializeWebhooksUserSetting,
+  type StoredUserWebhook,
+} from "../../lib/user-webhooks-setting.js";
 import { GrpcCode, jsonError } from "../../lib/grpc-status.js";
 import { b64urlToUtf8, utf8ToB64url } from "../../lib/b64url.js";
 import { hashPassword } from "../../services/password.js";
-import { userToJson } from "../../lib/serializers.js";
+import { authPrincipalFromUserRow, userToJson } from "../../lib/serializers.js";
 import { userStatsFieldsFromMemoRows } from "../../lib/user-stats-from-memos.js";
 
 /** Proto `User.Role`: ROLE_UNSPECIFIED=0, ADMIN=2, USER=3 — JSON often uses these numbers. */
@@ -41,6 +46,104 @@ const createUserBody = z.object({
   validateOnly: z.boolean().optional(),
 });
 
+function parsePageArgs(
+  rawPageSize: string | undefined,
+  rawToken: string | undefined,
+): { limit: number; offset: number } | { error: string } {
+  const limit = Math.min(1000, Math.max(1, Number(rawPageSize ?? 50)));
+  let offset = 0;
+  if (rawToken && rawToken.trim() !== "") {
+    let decoded = "";
+    try {
+      decoded = b64urlToUtf8(rawToken);
+    } catch {
+      return { error: "invalid page token" };
+    }
+    const n = Number(decoded);
+    if (!Number.isInteger(n) || n < 0) {
+      return { error: "invalid page token" };
+    }
+    offset = n;
+  }
+  return { limit, offset };
+}
+
+function hasPath(paths: string[] | undefined, ...names: string[]): boolean {
+  if (!paths || paths.length === 0) return false;
+  return names.some((n) => paths.includes(n));
+}
+
+function validateUserWebhookUrl(url: string): string | null {
+  const t = url.trim();
+  if (!t) return null;
+  let u: URL;
+  try {
+    u = new URL(t);
+  } catch {
+    return null;
+  }
+  if (u.protocol !== "http:" && u.protocol !== "https:") return null;
+  return t;
+}
+
+function userNotificationToJson(username: string, n: DbUserNotificationRow) {
+  const status =
+    n.status === "UNREAD"
+      ? "UNREAD"
+      : n.status === "ARCHIVED"
+        ? "ARCHIVED"
+        : "STATUS_UNSPECIFIED";
+  const base: Record<string, unknown> = {
+    name: `users/${username}/notifications/${n.inbox_id}`,
+    sender: `users/${n.sender_username}`,
+    status,
+    createTime: n.create_time,
+    type: "MEMO_COMMENT",
+  };
+  if (n.comment_memo_uid && n.related_memo_uid) {
+    base.memoComment = {
+      memo: `memos/${n.comment_memo_uid}`,
+      relatedMemo: `memos/${n.related_memo_uid}`,
+    };
+  }
+  return base;
+}
+
+function storedWebhooksToApi(username: string, list: StoredUserWebhook[]) {
+  return list.map((w) => ({
+    name: `users/${username}/webhooks/${w.id}`,
+    url: w.url,
+    displayName: w.title,
+  }));
+}
+
+function webhooksFromApiSettingBody(webhooks: unknown[] | undefined): StoredUserWebhook[] {
+  if (!Array.isArray(webhooks)) return [];
+  const out: StoredUserWebhook[] = [];
+  for (const x of webhooks) {
+    if (typeof x !== "object" || !x) continue;
+    const o = x as Record<string, unknown>;
+    const url = typeof o.url === "string" ? o.url : "";
+    const vUrl = validateUserWebhookUrl(url);
+    if (!vUrl) continue;
+    let id = "";
+    if (typeof o.name === "string") {
+      const parts = o.name.split("/");
+      id = parts[parts.length - 1] ?? "";
+    }
+    if (!id && typeof o.id === "string") id = o.id;
+    if (!id) continue;
+    const title =
+      typeof o.displayName === "string"
+        ? o.displayName
+        : typeof o.title === "string"
+          ? o.title
+          : "";
+    out.push({ id, title, url: vUrl });
+  }
+  return out;
+}
+
 export function createUserRoutes(deps: AppDeps) {
   const r = new Hono<{ Variables: ApiVariables }>();
   const repo = createRepository(deps.sql);
@@ -53,23 +156,17 @@ export function createUserRoutes(deps: AppDeps) {
     if (auth.role !== "ADMIN") {
       return jsonError(c, GrpcCode.PERMISSION_DENIED, "admin only");
     }
-    const pageSize = Math.min(
-      1000,
-      Math.max(1, Number(c.req.query("pageSize") ?? 50)),
-    );
-    const token = c.req.query("pageToken");
-    let offset = 0;
-    if (token) {
-      const n = Number(b64urlToUtf8(token));
-      offset = Number.isFinite(n) ? n : 0;
+    const page = parsePageArgs(c.req.query("pageSize"), c.req.query("pageToken"));
+    if ("error" in page) {
+      return jsonError(c, GrpcCode.INVALID_ARGUMENT, page.error);
     }
-    const users = await repo.listUsers({ limit: pageSize, offset });
+    const users = await repo.listUsers({ limit: page.limit, offset: page.offset });
     const next =
-      users.length === pageSize
-        ? utf8ToB64url(String(offset + pageSize))
+      users.length === page.limit
+        ? utf8ToB64url(String(page.offset + page.limit))
         : "";
     return c.json({
-      users: users.map(userToJson),
+      users: users.map((u) => userToJson(u, auth)),
       nextPageToken: next,
       totalSize: await repo.userCount(),
     });
@@ -107,21 +204,20 @@ export function createUserRoutes(deps: AppDeps) {
       return jsonError(c, GrpcCode.FAILED_PRECONDITION, "password not allowed");
     }
     if (body.validateOnly) {
-      return c.json(
-        userToJson({
-          username,
-          password_hash: "",
-          role,
-          display_name: body.user.displayName ?? null,
-          email: body.user.email ?? null,
-          avatar_url: null,
-          description: null,
-          state: "NORMAL",
-          create_time: new Date().toISOString(),
-          update_time: new Date().toISOString(),
-          deleted: 0,
-        }),
-      );
+      const row = {
+        username,
+        password_hash: "",
+        role: role === "ADMIN" ? ("ADMIN" as const) : ("USER" as const),
+        display_name: body.user.displayName ?? null,
+        email: body.user.email ?? null,
+        avatar_url: null,
+        description: null,
+        state: "NORMAL",
+        create_time: new Date().toISOString(),
+        update_time: new Date().toISOString(),
+        deleted: 0,
+      };
+      return c.json(userToJson(row, authPrincipalFromUserRow(row)));
     }
     if (!deps.demo) await repo.ensureSecretKey();
     const hash = await hashPassword(password);
@@ -132,7 +228,7 @@ export function createUserRoutes(deps: AppDeps) {
       displayName: body.user.displayName,
       email: body.user.email,
     });
-    return c.json(userToJson(created));
+    return c.json(userToJson(created, authPrincipalFromUserRow(created)));
   });
 
   const forUser = new Hono<{ Variables: ApiVariables }>();
@@ -165,7 +261,7 @@ export function createUserRoutes(deps: AppDeps) {
         pinnedMemos,
       } = userStatsFieldsFromMemoRows(rows, { useUpdateTimeForHeatmap });
       return c.json({
-        name: `users/${username}`,
+        name: `users/${username}/stats`,
         memoDisplayTimestamps,
         memoTypeStats,
         tagCount,
@@ -175,7 +271,7 @@ export function createUserRoutes(deps: AppDeps) {
     }
     const user = await repo.getUser(raw);
     if (!user) return jsonError(c, GrpcCode.NOT_FOUND, "user not found");
-    return c.json(userToJson(user));
+    return c.json(userToJson(user, c.get("auth") ?? null));
   });
 
   forUser.patch("/", async (c) => {
@@ -205,24 +301,27 @@ export function createUserRoutes(deps: AppDeps) {
     }
     const u = body.user;
     if (!u) return jsonError(c, GrpcCode.INVALID_ARGUMENT, "user required");
-    const paths = new Set(body.updateMask?.paths ?? []);
+    const paths = body.updateMask?.paths ?? [];
+    if (paths.length === 0) {
+      return jsonError(c, GrpcCode.INVALID_ARGUMENT, "update mask is empty");
+    }
     const fields: Parameters<typeof repo.updateUser>[1] = {};
-    if (paths.size === 0 || paths.has("displayName")) {
+    if (hasPath(paths, "displayName", "display_name")) {
       if (u.displayName !== undefined) fields.display_name = u.displayName;
     }
-    if (paths.size === 0 || paths.has("email")) {
+    if (hasPath(paths, "email")) {
       if (u.email !== undefined) fields.email = u.email;
     }
-    if (u.password && (paths.size === 0 || paths.has("password"))) {
+    if (u.password && hasPath(paths, "password")) {
       fields.password_hash = await hashPassword(u.password);
     }
-    if (u.role && auth.role === "ADMIN" && (paths.size === 0 || paths.has("role"))) {
+    if (u.role && auth.role === "ADMIN" && hasPath(paths, "role")) {
       fields.role = u.role === "ADMIN" ? "ADMIN" : "USER";
     }
     await repo.updateUser(username, fields);
     const next = await repo.getUser(username);
     if (!next) return jsonError(c, GrpcCode.NOT_FOUND, "user not found");
-    return c.json(userToJson(next));
+    return c.json(userToJson(next, auth));
   });
 
   forUser.delete("/", async (c) => {
@@ -249,20 +348,60 @@ export function createUserRoutes(deps: AppDeps) {
       return jsonError(c, GrpcCode.PERMISSION_DENIED, "permission denied");
     }
     const rows = await repo.listUserSettings(username);
+    const readMaskRaw = c.req.query("readMask");
+    const readMask = new Set(
+      (readMaskRaw ?? "")
+        .split(",")
+        .map((x) => x.trim())
+        .filter(Boolean),
+    );
+    const page = parsePageArgs(c.req.query("pageSize"), c.req.query("pageToken"));
+    if ("error" in page) {
+      return jsonError(c, GrpcCode.INVALID_ARGUMENT, page.error);
+    }
     const settings = rows.map((row) => {
-      const parsed = JSON.parse(row.json_value) as { payload?: unknown };
-      if (row.setting_key === "GENERAL") {
+      const key = row.setting_key;
+      if (key === "GENERAL") {
+        const parsed = JSON.parse(row.json_value) as { payload?: unknown };
+        const value = parsed.payload ?? { locale: "", memoVisibility: "", theme: "" };
         return {
           name: `users/${username}/settings/GENERAL`,
-          generalSetting: parsed.payload ?? { locale: "", memoVisibility: "", theme: "" },
+          ...(readMask.size === 0 || readMask.has("general_setting") || readMask.has("generalSetting")
+            ? { generalSetting: value }
+            : {}),
+        };
+      }
+      if (key === "WEBHOOKS") {
+        const stored = parseWebhooksFromUserSettingValue(row.json_value);
+        const value = { webhooks: storedWebhooksToApi(username, stored) };
+        return {
+          name: `users/${username}/settings/WEBHOOKS`,
+          ...(readMask.size === 0 || readMask.has("webhooks_setting") || readMask.has("webhooksSetting")
+            ? { webhooksSetting: value }
+            : {}),
         };
       }
       return {
-        name: `users/${username}/settings/${row.setting_key}`,
-        webhooksSetting: { webhooks: [] },
+        name: `users/${username}/settings/${key}`,
+        ...(readMask.size === 0 || readMask.has("webhooks_setting") || readMask.has("webhooksSetting")
+          ? { webhooksSetting: { webhooks: [] } }
+          : {}),
       };
     });
-    return c.json({ settings, nextPageToken: "", totalSize: settings.length });
+    if (!settings.some((x) => x.name === `users/${username}/settings/GENERAL`)) {
+      settings.unshift({
+        name: `users/${username}/settings/GENERAL`,
+        ...(readMask.size === 0 || readMask.has("general_setting") || readMask.has("generalSetting")
+          ? { generalSetting: { locale: "", memoVisibility: "", theme: "" } }
+          : {}),
+      });
+    }
+    const paged = settings.slice(page.offset, page.offset + page.limit);
+    const nextPageToken =
+      page.offset + page.limit < settings.length
+        ? utf8ToB64url(String(page.offset + page.limit))
+        : "";
+    return c.json({ settings: paged, nextPageToken, totalSize: settings.length });
   });
 
   forUser.get("/settings/:key", async (c) => {
@@ -284,6 +423,12 @@ export function createUserRoutes(deps: AppDeps) {
           generalSetting: { locale: "", memoVisibility: "", theme: "" },
         });
       }
+      if (key === "WEBHOOKS") {
+        return c.json({
+          name: `users/${username}/settings/WEBHOOKS`,
+          webhooksSetting: { webhooks: [] },
+        });
+      }
       return jsonError(c, GrpcCode.NOT_FOUND, "not found");
     }
     const parsed = JSON.parse(raw) as { payload?: unknown };
@@ -291,6 +436,13 @@ export function createUserRoutes(deps: AppDeps) {
       return c.json({
         name: `users/${username}/settings/GENERAL`,
         generalSetting: parsed.payload ?? {},
+      });
+    }
+    if (key === "WEBHOOKS") {
+      const stored = parseWebhooksFromUserSettingValue(raw);
+      return c.json({
+        name: `users/${username}/settings/WEBHOOKS`,
+        webhooksSetting: { webhooks: storedWebhooksToApi(username, stored) },
       });
     }
     return c.json({
@@ -310,12 +462,58 @@ export function createUserRoutes(deps: AppDeps) {
     if (auth.username !== username && auth.role !== "ADMIN") {
       return jsonError(c, GrpcCode.PERMISSION_DENIED, "permission denied");
     }
-    type Body = { setting?: { generalSetting?: unknown; webhooksSetting?: unknown } };
+    type Body = { setting?: { generalSetting?: unknown; webhooksSetting?: unknown }; updateMask?: { paths?: string[] } };
     const body = (await c.req.json()) as Body;
+    const paths = body.updateMask?.paths ?? [];
+    if (paths.length === 0) {
+      return jsonError(c, GrpcCode.INVALID_ARGUMENT, "update mask is empty");
+    }
+    if (key === "WEBHOOKS") {
+      const ws = body.setting?.webhooksSetting as { webhooks?: unknown[] } | undefined;
+      const stored = webhooksFromApiSettingBody(ws?.webhooks);
+      await repo.upsertUserSetting(username, key, serializeWebhooksUserSetting(stored));
+      return c.json({
+        name: `users/${username}/settings/WEBHOOKS`,
+        webhooksSetting: { webhooks: storedWebhooksToApi(username, stored) },
+      });
+    }
+    if (key === "GENERAL") {
+      const currentRaw = await repo.getUserSetting(username, "GENERAL");
+      const currentParsed = currentRaw
+        ? ((JSON.parse(currentRaw) as { payload?: Record<string, unknown> }).payload ?? {})
+        : {};
+      const incoming = (body.setting?.generalSetting as Record<string, unknown> | undefined) ?? {};
+      const next = { ...currentParsed };
+      if (hasPath(paths, "generalSetting", "general_setting")) {
+        await repo.upsertUserSetting(
+          username,
+          key,
+          JSON.stringify({ kind: "GENERAL", payload: incoming }),
+        );
+      } else {
+        if (hasPath(paths, "locale") && incoming.locale !== undefined) next.locale = incoming.locale;
+        if (hasPath(paths, "theme") && incoming.theme !== undefined) next.theme = incoming.theme;
+        if (hasPath(paths, "memoVisibility", "memo_visibility") && incoming.memoVisibility !== undefined) {
+          next.memoVisibility = incoming.memoVisibility;
+        }
+        await repo.upsertUserSetting(
+          username,
+          key,
+          JSON.stringify({ kind: "GENERAL", payload: next }),
+        );
+      }
+      const raw = await repo.getUserSetting(username, key);
+      if (!raw) {
+        return jsonError(c, GrpcCode.INTERNAL, "failed to read setting");
+      }
+      const parsed = JSON.parse(raw) as { payload?: unknown };
+      return c.json({
+        name: `users/${username}/settings/GENERAL`,
+        generalSetting: parsed.payload ?? {},
+      });
+    }
     const payload =
-      key === "GENERAL"
-        ? { kind: "GENERAL", payload: body.setting?.generalSetting ?? {} }
-        : { kind: key, payload: body.setting?.webhooksSetting ?? {} };
+      { kind: key, payload: body.setting?.webhooksSetting ?? {} };
     await repo.upsertUserSetting(username, key, JSON.stringify(payload));
     const raw = await repo.getUserSetting(username, key);
     if (!raw) {
@@ -416,12 +614,18 @@ export function createUserRoutes(deps: AppDeps) {
       return jsonError(c, GrpcCode.PERMISSION_DENIED, "permission denied");
     }
     const rows = await repo.listWebhooks(username);
+    const page = parsePageArgs(c.req.query("pageSize"), c.req.query("pageToken"));
+    if ("error" in page) return jsonError(c, GrpcCode.INVALID_ARGUMENT, page.error);
+    const all = storedWebhooksToApi(username, rows);
+    const webhooks = all.slice(page.offset, page.offset + page.limit);
+    const nextPageToken =
+      page.offset + page.limit < all.length
+        ? utf8ToB64url(String(page.offset + page.limit))
+        : "";
     return c.json({
-      webhooks: rows.map((w) => ({
-        name: `users/${username}/webhooks/${w.id}`,
-        url: w.url,
-        createTime: w.created_at,
-      })),
+      webhooks,
+      nextPageToken,
+      totalSize: all.length,
     });
   });
 
@@ -435,15 +639,56 @@ export function createUserRoutes(deps: AppDeps) {
     if (auth.username !== username && auth.role !== "ADMIN") {
       return jsonError(c, GrpcCode.PERMISSION_DENIED, "permission denied");
     }
-    type Body = { webhook?: { url?: string } };
+    type Body = { webhook?: { url?: string; displayName?: string } };
     const body = (await c.req.json()) as Body;
-    const url = body.webhook?.url;
+    const url = validateUserWebhookUrl(body.webhook?.url ?? "");
     if (!url) return jsonError(c, GrpcCode.INVALID_ARGUMENT, "url required");
-    const id = await repo.createWebhook(username, url);
+    const id = await repo.createWebhook(username, url, body.webhook?.displayName);
+    const title = body.webhook?.displayName?.trim() ?? "";
     return c.json({
       name: `users/${username}/webhooks/${id}`,
       url,
-      createTime: new Date().toISOString(),
+      displayName: title,
+    });
+  });
+
+  forUser.patch("/webhooks/:whId", async (c) => {
+    const auth = c.get("auth");
+    if (!auth) return jsonError(c, GrpcCode.UNAUTHENTICATED, "permission denied");
+    const username = c.req.param("username")!;
+    if (username.includes(":")) {
+      return jsonError(c, GrpcCode.INVALID_ARGUMENT, "invalid user resource");
+    }
+    if (auth.username !== username && auth.role !== "ADMIN") {
+      return jsonError(c, GrpcCode.PERMISSION_DENIED, "permission denied");
+    }
+    type Body = {
+      webhook?: { url?: string; displayName?: string };
+      updateMask?: { paths?: string[] };
+    };
+    const body = (await c.req.json()) as Body;
+    const paths = new Set(body.updateMask?.paths ?? []);
+    let url = body.webhook?.url;
+    if (url !== undefined && (paths.size === 0 || paths.has("url"))) {
+      const v = validateUserWebhookUrl(url);
+      if (!v) return jsonError(c, GrpcCode.INVALID_ARGUMENT, "invalid url");
+      url = v;
+    }
+    const whId = c.req.param("whId");
+    const ok = await repo.updateWebhook(
+      username,
+      whId,
+      { url, displayName: body.webhook?.displayName },
+      paths,
+    );
+    if (!ok) return jsonError(c, GrpcCode.NOT_FOUND, "not found");
+    const list = await repo.listWebhooks(username);
+    const w = list.find((x) => x.id === whId);
+    if (!w) return jsonError(c, GrpcCode.NOT_FOUND, "not found");
+    return c.json({
+      name: `users/${username}/webhooks/${w.id}`,
+      url: w.url,
+      displayName: w.title,
     });
   });
 
@@ -469,18 +714,12 @@ export function createUserRoutes(deps: AppDeps) {
     if (username.includes(":")) {
       return jsonError(c, GrpcCode.INVALID_ARGUMENT, "invalid user resource");
     }
-    if (auth.username !== username && auth.role !== "ADMIN") {
+    if (auth.username !== username) {
       return jsonError(c, GrpcCode.PERMISSION_DENIED, "permission denied");
     }
     const rows = await repo.listNotifications(username);
     return c.json({
-      notifications: rows.map((n) => ({
-        name: `users/${username}/notifications/${n.id}`,
-        status: n.status,
-        createTime: n.create_time,
-        updateTime: n.update_time,
-        payload: JSON.parse(n.payload_json) as unknown,
-      })),
+      notifications: rows.map((n) => userNotificationToJson(username, n)),
     });
   });
 
@@ -491,26 +730,29 @@ export function createUserRoutes(deps: AppDeps) {
     if (username.includes(":")) {
       return jsonError(c, GrpcCode.INVALID_ARGUMENT, "invalid user resource");
     }
-    if (auth.username !== username && auth.role !== "ADMIN") {
+    if (auth.username !== username) {
       return jsonError(c, GrpcCode.PERMISSION_DENIED, "permission denied");
     }
-    type Body = { notification?: { status?: string; payload?: unknown } };
+    const inboxId = Number(c.req.param("nid"));
+    if (!Number.isInteger(inboxId) || inboxId < 1) {
+      return jsonError(c, GrpcCode.INVALID_ARGUMENT, "invalid notification id");
+    }
+    type Body = { notification?: { status?: string }; updateMask?: { paths?: string[] } };
     const body = (await c.req.json()) as Body;
-    const payload = JSON.stringify(body.notification?.payload ?? {});
-    const ok = await repo.updateNotification({
-      id: c.req.param("nid"),
-      username,
-      status: body.notification?.status ?? "READ",
-      payload,
-    });
-    if (!ok) return jsonError(c, GrpcCode.NOT_FOUND, "not found");
-    return c.json({
-      name: `users/${username}/notifications/${c.req.param("nid")}`,
-      status: body.notification?.status ?? "READ",
-      createTime: new Date().toISOString(),
-      updateTime: new Date().toISOString(),
-      payload: body.notification?.payload ?? {},
-    });
+    const paths = body.updateMask?.paths ?? [];
+    if (!paths.includes("status")) {
+      return jsonError(c, GrpcCode.INVALID_ARGUMENT, "updateMask must include status");
+    }
+    const rawStatus = body.notification?.status;
+    let status: "UNREAD" | "ARCHIVED" | null = null;
+    if (rawStatus === "UNREAD") status = "UNREAD";
+    else if (rawStatus === "ARCHIVED") status = "ARCHIVED";
+    if (!status) {
+      return jsonError(c, GrpcCode.INVALID_ARGUMENT, "invalid status");
+    }
+    const updated = await repo.updateNotificationStatus({ username, inboxId, status });
+    if (!updated) return jsonError(c, GrpcCode.NOT_FOUND, "not found");
+    return c.json(userNotificationToJson(username, updated));
   });
 
   forUser.delete("/notifications/:nid", async (c) => {
@@ -520,10 +762,14 @@ export function createUserRoutes(deps: AppDeps) {
     if (username.includes(":")) {
       return jsonError(c, GrpcCode.INVALID_ARGUMENT, "invalid user resource");
     }
-    if (auth.username !== username && auth.role !== "ADMIN") {
+    if (auth.username !== username) {
       return jsonError(c, GrpcCode.PERMISSION_DENIED, "permission denied");
     }
-    const ok = await repo.deleteNotification(username, c.req.param("nid"));
+    const inboxId = Number(c.req.param("nid"));
+    if (!Number.isInteger(inboxId) || inboxId < 1) {
+      return jsonError(c, GrpcCode.INVALID_ARGUMENT, "invalid notification id");
+    }
+    const ok = await repo.deleteNotification(username, inboxId);
     if (!ok) return jsonError(c, GrpcCode.NOT_FOUND, "not found");
     return c.json({});
   });
@@ -539,12 +785,22 @@ export function createUserRoutes(deps: AppDeps) {
       return jsonError(c, GrpcCode.PERMISSION_DENIED, "permission denied");
     }
     const rows = await repo.listShortcuts(username);
+    const page = parsePageArgs(c.req.query("pageSize"), c.req.query("pageToken"));
+    if ("error" in page) return jsonError(c, GrpcCode.INVALID_ARGUMENT, page.error);
+    const all = rows.map((s) => ({
+      name: `users/${username}/shortcuts/${s.shortcut_id}`,
+      title: s.title,
+      filter: s.filter_expr ?? "",
+    }));
+    const shortcuts = all.slice(page.offset, page.offset + page.limit);
+    const nextPageToken =
+      page.offset + page.limit < all.length
+        ? utf8ToB64url(String(page.offset + page.limit))
+        : "";
     return c.json({
-      shortcuts: rows.map((s) => ({
-        name: `users/${username}/shortcuts/${s.shortcut_id}`,
-        title: s.title,
-        filter: s.filter_expr ?? "",
-      })),
+      shortcuts,
+      nextPageToken,
+      totalSize: all.length,
     });
   });
 
@@ -579,7 +835,7 @@ export function createUserRoutes(deps: AppDeps) {
     if (auth.username !== username && auth.role !== "ADMIN") {
       return jsonError(c, GrpcCode.PERMISSION_DENIED, "permission denied");
     }
-    type Body = { shortcut?: { title?: string; filter?: string } };
+    type Body = { shortcut?: { title?: string; filter?: string }; updateMask?: { paths?: string[] } };
     const body = (await c.req.json()) as Body;
     const title = body.shortcut?.title;
     if (!title) return jsonError(c, GrpcCode.INVALID_ARGUMENT, "title required");
@@ -607,11 +863,15 @@ export function createUserRoutes(deps: AppDeps) {
     if (auth.username !== username && auth.role !== "ADMIN") {
       return jsonError(c, GrpcCode.PERMISSION_DENIED, "permission denied");
     }
-    type Body = { shortcut?: { title?: string; filter?: string } };
+    type Body = { shortcut?: { title?: string; filter?: string }; updateMask?: { paths?: string[] } };
     const body = (await c.req.json()) as Body;
+    const paths = body.updateMask?.paths ?? [];
+    if (paths.length === 0) {
+      return jsonError(c, GrpcCode.INVALID_ARGUMENT, "update mask is empty");
+    }
     await repo.updateShortcut(username, c.req.param("sid"), {
-      title: body.shortcut?.title,
-      filter: body.shortcut?.filter,
+      title: hasPath(paths, "title") ? body.shortcut?.title : undefined,
+      filter: hasPath(paths, "filter") ? body.shortcut?.filter : undefined,
     });
     const rows = await repo.listShortcuts(username);
     const s = rows.find((x) => x.shortcut_id === c.req.param("sid"));

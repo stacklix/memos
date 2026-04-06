@@ -1,18 +1,15 @@
--- Truncate app data on local D1 (wrangler d1 execute memos --local --file).
+-- Truncate app data on local D1 (wrangler d1 execute MEMOS_DB --local --file).
 -- Keeps table definitions and schema_migrations / Wrangler migration bookkeeping.
 PRAGMA foreign_keys = OFF;
-DELETE FROM memo_relations;
-DELETE FROM memo_reactions;
-DELETE FROM memo_shares;
-DELETE FROM memos;
-DELETE FROM refresh_sessions;
-DELETE FROM personal_access_tokens;
-DELETE FROM shortcuts;
-DELETE FROM user_settings_kv;
-DELETE FROM user_webhooks;
-DELETE FROM user_notifications;
-DELETE FROM users;
-DELETE FROM instance_settings;
-DELETE FROM instance_kv;
+DELETE FROM memo_relation;
+DELETE FROM reaction;
+DELETE FROM memo_share;
+DELETE FROM memo;
+DELETE FROM attachment;
+DELETE FROM inbox;
+DELETE FROM idp;
+DELETE FROM user_setting;
+DELETE FROM user;
+DELETE FROM system_setting;
 DELETE FROM sqlite_sequence;
 PRAGMA foreign_keys = ON;

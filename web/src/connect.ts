@@ -12,7 +12,9 @@ import { redirectOnAuthFailure } from "./utils/auth-redirect";
 import type {
   InstanceProfile,
   InstanceSetting,
+  InstanceSetting_StorageSetting_StorageType,
   InstanceSetting_MemoRelatedSetting,
+  InstanceSetting_NotificationSetting,
   InstanceSetting_TagsSetting,
 } from "./types/proto/api/v1/instance_service_pb";
 import {
@@ -20,11 +22,16 @@ import {
   InstanceSettingSchema,
   InstanceSetting_GeneralSettingSchema,
   InstanceSetting_MemoRelatedSettingSchema,
+  InstanceSetting_NotificationSettingSchema,
+  InstanceSetting_StorageSetting_StorageType,
+  InstanceSetting_StorageSettingSchema,
   InstanceSetting_TagsSettingSchema,
 } from "./types/proto/api/v1/instance_service_pb";
 import { State } from "./types/proto/api/v1/common_pb";
 import type { Memo, MemoShare, MemoRelation, Reaction } from "./types/proto/api/v1/memo_service_pb";
 import { MemoShareSchema, MemoRelationSchema, ReactionSchema } from "./types/proto/api/v1/memo_service_pb";
+import type { Attachment } from "./types/proto/api/v1/attachment_service_pb";
+import { AttachmentSchema } from "./types/proto/api/v1/attachment_service_pb";
 import type { Shortcut } from "./types/proto/api/v1/shortcut_service_pb";
 import { ShortcutSchema } from "./types/proto/api/v1/shortcut_service_pb";
 import type { CreatePersonalAccessTokenResponse, PersonalAccessToken, User, UserSetting } from "./types/proto/api/v1/user_service_pb";
@@ -39,6 +46,22 @@ import {
 const API = "/api/v1";
 const RETRY_HEADER = "X-Retry";
 const RETRY_HEADER_VALUE = "true";
+
+type InstanceSettingWithStorageMeta = InstanceSetting & {
+  __supportedStorageTypes?: InstanceSetting_StorageSetting_StorageType[];
+};
+
+function parseSupportedStorageTypes(raw: unknown): InstanceSetting_StorageSetting_StorageType[] | undefined {
+  if (!Array.isArray(raw)) return undefined;
+  const out: InstanceSetting_StorageSetting_StorageType[] = [];
+  for (const item of raw) {
+    if (item === "DATABASE") out.push(InstanceSetting_StorageSetting_StorageType.DATABASE);
+    else if (item === "LOCAL") out.push(InstanceSetting_StorageSetting_StorageType.LOCAL);
+    else if (item === "S3") out.push(InstanceSetting_StorageSetting_StorageType.S3);
+    else if (item === "R2") out.push(4 as InstanceSetting_StorageSetting_StorageType);
+  }
+  return out.length > 0 ? out : undefined;
+}
 
 function grpcToCode(code: number | undefined, status: number): Code {
   if (code === 16 || status === 401) return Code.Unauthenticated;
@@ -211,6 +234,25 @@ function memoRelatedToApiJson(v: InstanceSetting_MemoRelatedSetting): Record<str
   };
 }
 
+function notificationToApiJson(v: InstanceSetting_NotificationSetting): Record<string, unknown> {
+  return {
+    email: v.email
+      ? {
+          enabled: v.email.enabled,
+          smtpHost: v.email.smtpHost,
+          smtpPort: v.email.smtpPort,
+          smtpUsername: v.email.smtpUsername,
+          smtpPassword: v.email.smtpPassword,
+          fromEmail: v.email.fromEmail,
+          fromName: v.email.fromName,
+          replyTo: v.email.replyTo,
+          useTls: v.email.useTls,
+          useSsl: v.email.useSsl,
+        }
+      : undefined,
+  };
+}
+
 function instanceSettingFromResponse(j: Record<string, unknown>): InstanceSetting {
   const name = String(j.name ?? "");
   if (j.generalSetting) {
@@ -231,12 +273,35 @@ function instanceSettingFromResponse(j: Record<string, unknown>): InstanceSettin
       },
     });
   }
+  if (j.storageSetting) {
+    const setting = create(InstanceSettingSchema, {
+      name,
+      value: {
+        case: "storageSetting",
+        value: create(InstanceSetting_StorageSettingSchema, j.storageSetting as Record<string, unknown>),
+      },
+    });
+    const supportedStorageTypes = parseSupportedStorageTypes((j as { supportedStorageTypes?: unknown }).supportedStorageTypes);
+    if (supportedStorageTypes) {
+      (setting as InstanceSettingWithStorageMeta).__supportedStorageTypes = supportedStorageTypes;
+    }
+    return setting;
+  }
   if (j.tagsSetting) {
     return create(InstanceSettingSchema, {
       name,
       value: {
         case: "tagsSetting",
         value: create(InstanceSetting_TagsSettingSchema, j.tagsSetting as Record<string, unknown>),
+      },
+    });
+  }
+  if (j.notificationSetting) {
+    return create(InstanceSettingSchema, {
+      name,
+      value: {
+        case: "notificationSetting",
+        value: create(InstanceSetting_NotificationSettingSchema, j.notificationSetting as Record<string, unknown>),
       },
     });
   }
@@ -287,6 +352,26 @@ function memoShareFromJson(j: Record<string, unknown>): MemoShare {
   } as Record<string, unknown>);
 }
 
+function attachmentFromJson(j: Record<string, unknown>): Attachment {
+  return create(AttachmentSchema, {
+    name: String(j.name ?? ""),
+    createTime: j.createTime ? timestampFromDate(new Date(String(j.createTime))) : undefined,
+    filename: String(j.filename ?? ""),
+    externalLink: String(j.externalLink ?? ""),
+    type: String(j.type ?? ""),
+    size: BigInt(String(j.size ?? "0")),
+    memo: j.memo ? String(j.memo) : undefined,
+  });
+}
+
+function bytesToBase64(bytes: Uint8Array): string {
+  let bin = "";
+  for (let i = 0; i < bytes.length; i++) {
+    bin += String.fromCharCode(bytes[i]!);
+  }
+  return btoa(bin);
+}
+
 function listMemosQuery(req: Record<string, unknown>): string {
   const p = new URLSearchParams();
   if (req.pageSize != null) p.set("pageSize", String(req.pageSize));
@@ -326,6 +411,26 @@ export const instanceServiceClient = {
       settingBody.tagsSetting = tagsSettingToApiJson(v.value);
     } else if (v.case === "memoRelatedSetting") {
       settingBody.memoRelatedSetting = memoRelatedToApiJson(v.value);
+    } else if (v.case === "storageSetting") {
+      settingBody.storageSetting = {
+        storageType: v.value.storageType,
+        filepathTemplate: v.value.filepathTemplate,
+        uploadSizeLimitMb: Number(v.value.uploadSizeLimitMb ?? 0n),
+        ...(v.value.s3Config
+          ? {
+              s3Config: {
+                accessKeyId: v.value.s3Config.accessKeyId,
+                accessKeySecret: v.value.s3Config.accessKeySecret,
+                endpoint: v.value.s3Config.endpoint,
+                region: v.value.s3Config.region,
+                bucket: v.value.s3Config.bucket,
+                usePathStyle: v.value.s3Config.usePathStyle,
+              },
+            }
+          : {}),
+      };
+    } else if (v.case === "notificationSetting") {
+      settingBody.notificationSetting = notificationToApiJson(v.value);
     } else {
       throw new ConnectError("Unsupported instance setting update", Code.InvalidArgument);
     }
@@ -447,13 +552,20 @@ export const userServiceClient = {
     await apiJson(`/users/${encodeURIComponent(username)}`, { method: "DELETE" });
     return {};
   },
-  async listUserSettings(req: { parent: string }) {
+  async listUserSettings(req: { parent: string; pageSize?: number; pageToken?: string; readMask?: string }) {
     const u = userSeg(req.parent);
-    const j = await apiJson<{ settings: Record<string, unknown>[] }>(`/users/${encodeURIComponent(u)}/settings`);
+    const q = new URLSearchParams();
+    if (req.pageSize != null) q.set("pageSize", String(req.pageSize));
+    if (req.pageToken) q.set("pageToken", req.pageToken);
+    if (req.readMask) q.set("readMask", req.readMask);
+    const qs = q.toString();
+    const j = await apiJson<{ settings: Record<string, unknown>[]; nextPageToken?: string; totalSize?: number }>(
+      `/users/${encodeURIComponent(u)}/settings${qs ? `?${qs}` : ""}`,
+    );
     return {
       settings: j.settings.map((s) => userSettingFromJson(s)),
-      nextPageToken: "",
-      totalSize: j.settings.length,
+      nextPageToken: j.nextPageToken ?? "",
+      totalSize: j.totalSize ?? j.settings.length,
     };
   },
   async updateUserSetting(req: { setting: UserSetting; updateMask: FieldMask }): Promise<UserSetting> {
@@ -468,7 +580,10 @@ export const userServiceClient = {
     }
     const res = await apiFetch(`/users/${encodeURIComponent(user)}/settings/${encodeURIComponent(key)}`, {
       method: "PATCH",
-      body: JSON.stringify(body),
+      body: JSON.stringify({
+        ...body,
+        updateMask: req.updateMask,
+      }),
     });
     await throwUnlessOk(res);
     return userSettingFromJson((await readJson(res)) as Record<string, unknown>);
@@ -530,10 +645,14 @@ export const userServiceClient = {
     await apiJson(`/users/${encodeURIComponent(m[1])}/personalAccessTokens/${encodeURIComponent(m[2])}`, { method: "DELETE" });
     return {};
   },
-  async listUserWebhooks(req: { parent: string }) {
+  async listUserWebhooks(req: { parent: string; pageSize?: number; pageToken?: string }) {
     const u = userSeg(req.parent);
+    const q = new URLSearchParams();
+    if (req.pageSize != null) q.set("pageSize", String(req.pageSize));
+    if (req.pageToken) q.set("pageToken", req.pageToken);
+    const qs = q.toString();
     const j = await apiJson<{ webhooks: { name: string; url: string; createTime?: string }[] }>(
-      `/users/${encodeURIComponent(u)}/webhooks`,
+      `/users/${encodeURIComponent(u)}/webhooks${qs ? `?${qs}` : ""}`,
     );
     return {
       webhooks: j.webhooks.map((w) => ({
@@ -556,10 +675,12 @@ export const userServiceClient = {
     const name = wh.name ?? "";
     const m = name.match(/^users\/([^/]+)\/webhooks\/([^/]+)$/);
     if (!m) throw new ConnectError("invalid webhook name", Code.InvalidArgument);
-    await apiJson(`/users/${encodeURIComponent(m[1])}/webhooks/${encodeURIComponent(m[2])}`, { method: "DELETE" });
-    return apiJson<Record<string, unknown>>(`/users/${encodeURIComponent(m[1])}/webhooks`, {
-      method: "POST",
-      body: JSON.stringify({ webhook: { url: wh.url } }),
+    return apiJson<Record<string, unknown>>(`/users/${encodeURIComponent(m[1])}/webhooks/${encodeURIComponent(m[2])}`, {
+      method: "PATCH",
+      body: JSON.stringify({
+        webhook: { url: wh.url, displayName: wh.displayName },
+        updateMask: req.updateMask,
+      }),
     });
   },
   async deleteUserWebhook(req: { name: string }): Promise<object> {
@@ -596,16 +717,22 @@ export const userServiceClient = {
 };
 
 export const shortcutServiceClient = {
-  async listShortcuts(req: { parent?: string }) {
+  async listShortcuts(req: { parent?: string; pageSize?: number; pageToken?: string }) {
     if (!req.parent) {
       return { shortcuts: [] as Shortcut[], nextPageToken: "", totalSize: 0 };
     }
     const u = userSeg(req.parent);
-    const j = await apiJson<{ shortcuts: Record<string, unknown>[] }>(`/users/${encodeURIComponent(u)}/shortcuts`);
+    const q = new URLSearchParams();
+    if (req.pageSize != null) q.set("pageSize", String(req.pageSize));
+    if (req.pageToken) q.set("pageToken", req.pageToken);
+    const qs = q.toString();
+    const j = await apiJson<{ shortcuts: Record<string, unknown>[]; nextPageToken?: string; totalSize?: number }>(
+      `/users/${encodeURIComponent(u)}/shortcuts${qs ? `?${qs}` : ""}`,
+    );
     return {
       shortcuts: j.shortcuts.map((s) => shortcutFromJson(s)),
-      nextPageToken: "",
-      totalSize: j.shortcuts.length,
+      nextPageToken: j.nextPageToken ?? "",
+      totalSize: j.totalSize ?? j.shortcuts.length,
     };
   },
   async createShortcut(req: { parent?: string; shortcut?: { title?: string; filter?: string } }) {
@@ -624,6 +751,7 @@ export const shortcutServiceClient = {
       method: "PATCH",
       body: JSON.stringify({
         shortcut: { title: req.shortcut.title, filter: req.shortcut.filter },
+        updateMask: req.updateMask,
       }),
     });
     return { shortcut: shortcutFromJson(j) };
@@ -670,6 +798,30 @@ export const memoServiceClient = {
       }),
     });
     return memoFromJson(j);
+  },
+  async listMemoAttachments(req: { name: string; pageSize?: number; pageToken?: string }) {
+    const id = memoIdFromName(req.name);
+    const q = new URLSearchParams();
+    if (req.pageSize != null) q.set("pageSize", String(req.pageSize));
+    if (req.pageToken) q.set("pageToken", req.pageToken);
+    const qs = q.toString();
+    const j = await apiJson<{ attachments: Record<string, unknown>[]; nextPageToken?: string }>(
+      `/memos/${encodeURIComponent(id)}/attachments${qs ? `?${qs}` : ""}`,
+    );
+    return {
+      attachments: (j.attachments ?? []).map((a) => attachmentFromJson(a)),
+      nextPageToken: j.nextPageToken ?? "",
+    };
+  },
+  async setMemoAttachments(req: { name: string; attachments: Attachment[] }) {
+    const id = memoIdFromName(req.name);
+    await apiJson(`/memos/${encodeURIComponent(id)}/attachments`, {
+      method: "PATCH",
+      body: JSON.stringify({
+        attachments: req.attachments.map((a) => ({ name: a.name })),
+      }),
+    });
+    return {};
   },
   async updateMemo(req: { memo: Memo; updateMask: FieldMask }) {
     const id = memoIdFromName(req.memo.name);
@@ -826,14 +978,49 @@ export const memoServiceClient = {
 
 /** Removed server features: keep export so accidental imports fail at runtime clearly. */
 export const attachmentServiceClient = {
-  async listAttachments(): Promise<{ attachments: never[] }> {
-    throw new ConnectError("attachments are not supported", Code.Unimplemented);
+  async listAttachments(req: { pageSize?: number; pageToken?: string; filter?: string }): Promise<{
+    attachments: Attachment[];
+    nextPageToken: string;
+    totalSize: number;
+  }> {
+    const q = new URLSearchParams();
+    if (req.pageSize != null) q.set("pageSize", String(req.pageSize));
+    if (req.pageToken) q.set("pageToken", String(req.pageToken));
+    if (req.filter) q.set("filter", req.filter);
+    const qs = q.toString();
+    const j = await apiJson<{
+      attachments: Record<string, unknown>[];
+      nextPageToken?: string;
+      totalSize?: number;
+    }>(`/attachments${qs ? `?${qs}` : ""}`);
+    return {
+      attachments: (j.attachments ?? []).map((a) => attachmentFromJson(a)),
+      nextPageToken: j.nextPageToken ?? "",
+      totalSize: j.totalSize ?? j.attachments.length,
+    };
   },
-  async createAttachment(): Promise<never> {
-    throw new ConnectError("attachments are not supported", Code.Unimplemented);
+  async createAttachment(req: { attachment?: Attachment; attachmentId?: string }): Promise<Attachment> {
+    const a = req.attachment;
+    const base64Content = a?.content && a.content.length > 0 ? bytesToBase64(a.content) : "";
+    const j = await apiJson<Record<string, unknown>>("/attachments", {
+      method: "POST",
+      body: JSON.stringify({
+        attachment: {
+          filename: a?.filename ?? "",
+          content: base64Content,
+          type: a?.type ?? "",
+          memo: a?.memo ?? "",
+          externalLink: a?.externalLink ?? "",
+        },
+        attachmentId: req.attachmentId ?? "",
+      }),
+    });
+    return attachmentFromJson(j);
   },
-  async deleteAttachment(): Promise<never> {
-    throw new ConnectError("attachments are not supported", Code.Unimplemented);
+  async deleteAttachment(req: { name: string }): Promise<object> {
+    const id = req.name.replace(/^attachments\//, "");
+    await apiJson(`/attachments/${encodeURIComponent(id)}`, { method: "DELETE" });
+    return {};
   },
 };
 

@@ -10,7 +10,7 @@
 | `server/`        | 后端源码：Hono 应用、数据库适配、Worker / Node 入口                                                                                                                                                                                                                 |
 | `web/`           | 前端源码（React、Vite）                                                                                                                                                                                                                                    |
 | `dist/`          | **构建产物根目录**（默认不提交）：见下表                                                                                                                                                                                                                              |
-| `migrations/`    | 编号 SQL：**文件名**须为 `**NNNN_描述.sql`**（四位数字前缀，如 `0001_initial.sql`）。**Node** 启动时按名字顺序应用尚未记录的版本；**D1** 用 `wrangler d1 migrations apply`；`**npm run dev:worker`** 会先对本地 D1 执行 `wrangler d1 migrations apply memos --local`。新增迁移一般**只加文件**，不必改 TypeScript。 |
+| `migrations/`    | 编号 SQL：**文件名**须为 `**NNNN_描述.sql`**（四位数字前缀，如 `0001_initial.sql`）。**Node** 启动时按名字顺序应用尚未记录的版本；**D1** 用 `wrangler d1 migrations apply`；`**npm run dev:worker`** 会先对本地 D1 执行 `wrangler d1 migrations apply MEMOS_DB --local`。新增迁移一般**只加文件**，不必改 TypeScript。 |
 | `wrangler.jsonc` | Cloudflare Worker、D1、静态资源目录（`dist/public`）                                                                                                                                                                                                          |
 
 
@@ -79,7 +79,7 @@ npm install
   ```bash
    npm run db:migrate:d1:local
   ```
-   等价于 `wrangler d1 migrations apply memos --local`（数据库名 `**memos**` 须与 `wrangler.jsonc` 里 `database_name` 一致）。
+   等价于 `wrangler d1 migrations apply MEMOS_DB --local`（按 D1 binding `**MEMOS_DB**` 解析，可避免改 `database_name` 后脚本失配）。
 3. **启动本地 Worker**（`scripts/ensure-web-build-for-worker.mjs` 会在 `**dist/public` 不存在或比 `web/` 源码旧** 时才跑 `npm run build:web`，否则跳过以加快启动；需要强制全量构建时可先手动 `npm run build:web`）。`npm run dev:worker` 会在 `**wrangler dev` 之前**执行 `**npm run db:migrate:d1:local`**。
   ```bash
    npm run dev:worker
@@ -90,7 +90,7 @@ npm install
   dev:worker
   ```
 
-按终端提示访问 Wrangler 给出的本地 URL。若修改了 `wrangler.jsonc` 中的 D1 `database_id`，需与你在 Cloudflare 上创建的数据库一致（本地开发常用占位或测试库）。
+按终端提示访问 Wrangler 给出的本地 URL。若希望本地与仓库配置解耦，可复制 `wrangler.local.jsonc.example` 为 `wrangler.local.jsonc`（已在 `.gitignore`），本地脚本会优先使用该文件。
 
 ### 常用开发命令速查
 
@@ -166,7 +166,7 @@ npm install
   ```bash
    npm run build:web
   ```
-3. **（首次或迁移有更新）对远程 D1 执行迁移**（数据库名与 `wrangler.jsonc` 里 `database_name` 一致，当前为 `memos`）：
+3. **（首次或迁移有更新）对远程 D1 执行迁移**（按 D1 binding `MEMOS_DB` 解析）：
   ```bash
    npm run db:migrate:d1:remote
   ```
