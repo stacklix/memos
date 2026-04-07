@@ -177,17 +177,15 @@ export function createMemoRoutes(deps: AppDeps) {
   r.post("/", async (c) => {
     const auth = c.get("auth");
     if (!auth) return jsonError(c, GrpcCode.UNAUTHENTICATED, "permission denied");
-    type Body = {
-      memo?: {
-        content?: string;
-        visibility?: unknown;
-        state?: unknown;
-        pinned?: boolean;
-        location?: unknown;
-      };
+    type MemoBody = {
+      content?: string;
+      visibility?: unknown;
+      state?: unknown;
+      pinned?: boolean;
+      location?: unknown;
     };
-    const body = (await c.req.json()) as Body;
-    const m = body.memo;
+    // Match golang v0.26.x contract: request body is Memo fields at top-level.
+    const m = (await c.req.json()) as MemoBody;
     if (!m?.content) return jsonError(c, GrpcCode.INVALID_ARGUMENT, "memo.content required");
     const locIn = parseMemoLocationForCreate(m.location);
     if (!locIn.ok) {
@@ -241,18 +239,16 @@ export function createMemoRoutes(deps: AppDeps) {
     if (row.creator_username !== auth.username && auth.role !== "ADMIN") {
       return jsonError(c, GrpcCode.PERMISSION_DENIED, "permission denied");
     }
-    type Body = {
-      memo?: {
-        content?: string;
-        visibility?: unknown;
-        state?: unknown;
-        pinned?: boolean;
-        displayTime?: string;
-        location?: unknown;
-      };
+    type MemoBody = {
+      content?: string;
+      visibility?: unknown;
+      state?: unknown;
+      pinned?: boolean;
+      displayTime?: string;
+      location?: unknown;
     };
-    const body = (await c.req.json()) as Body;
-    const m = body.memo;
+    // Match golang v0.26.x contract: request body is Memo fields at top-level.
+    const m = (await c.req.json()) as MemoBody;
     if (!m) return jsonError(c, GrpcCode.INVALID_ARGUMENT, "memo required");
     const locPatch = parseMemoLocationForPatch(m.location);
     if (locPatch.kind === "error") {

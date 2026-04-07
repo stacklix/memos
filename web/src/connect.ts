@@ -785,21 +785,19 @@ export const memoServiceClient = {
     const j = await apiJson<Record<string, unknown>>("/memos", {
       method: "POST",
       body: JSON.stringify({
-        memo: {
-          content: m?.content,
-          visibility: m?.visibility,
-          state: m?.state,
-          pinned: m?.pinned,
-          ...(loc
-            ? {
-                location: {
-                  placeholder: loc.placeholder,
-                  latitude: loc.latitude,
-                  longitude: loc.longitude,
-                },
-              }
-            : {}),
-        },
+        content: m?.content,
+        visibility: m?.visibility,
+        state: m?.state,
+        pinned: m?.pinned,
+        ...(loc
+          ? {
+              location: {
+                placeholder: loc.placeholder,
+                latitude: loc.latitude,
+                longitude: loc.longitude,
+              },
+            }
+          : {}),
       }),
     });
     return memoFromJson(j);
@@ -854,7 +852,7 @@ export const memoServiceClient = {
     }
     const j = await apiJson<Record<string, unknown>>(`/memos/${encodeURIComponent(id)}`, {
       method: "PATCH",
-      body: JSON.stringify({ memo: patch }),
+      body: JSON.stringify(patch),
     });
     return memoFromJson(j);
   },

@@ -86,7 +86,7 @@ export async function postMemo(
   return apiJson(app, "/api/v1/memos", {
     method: "POST",
     bearer: token,
-    json: { memo },
+    json: memo,
   });
 }
 

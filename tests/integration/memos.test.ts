@@ -73,7 +73,7 @@ describe("integration: memos", () => {
     const patch = await apiJson(app, `/api/v1/memos/${encodeURIComponent(id)}`, {
       method: "PATCH",
       bearer: accessToken,
-      json: { memo: { content: "v2" } },
+      json: { content: "v2" },
     });
     expect(patch.status).toBe(200);
     expect((patch.body as { content: string }).content).toBe("v2");
