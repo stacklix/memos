@@ -45,7 +45,10 @@ export function debugHttpLog(enabled: boolean): MiddlewareHandler {
     }
     console.log(`[debug:http] ${id} request headers`, JSON.stringify(headerRecord(c.req.raw.headers), null, 2));
     if (reqBody) {
-      console.log(`[debug:http] ${id} request body`, truncate(reqBody, MAX_BODY_CHARS));
+      console.log(
+        `[debug:http] ${id} ${method} ${u.pathname}${u.search} request body`,
+        truncate(reqBody, MAX_BODY_CHARS),
+      );
     }
 
     await next();
@@ -61,6 +64,9 @@ export function debugHttpLog(enabled: boolean): MiddlewareHandler {
     const ct = res.headers.get("content-type") ?? "";
     console.log(`[debug:http] ${id} <<< ${res.status} content-type=${ct || "(none)"}`);
     console.log(`[debug:http] ${id} response headers`, JSON.stringify(headerRecord(res.headers), null, 2));
-    console.log(`[debug:http] ${id} response body`, resBody ? truncate(resBody, MAX_BODY_CHARS) : "(empty)");
+    console.log(
+      `[debug:http] ${id} ${method} ${u.pathname}${u.search} response body`,
+      resBody ? truncate(resBody, MAX_BODY_CHARS) : "(empty)",
+    );
   };
 }

@@ -71,6 +71,14 @@ function readJsonOrForm(data: string): Record<string, unknown> {
   }
 }
 
+function getOAuthRequestHeaders(extra?: Record<string, string>): Record<string, string> {
+  return {
+    "User-Agent": "memos-oauth2-client",
+    Accept: "application/json",
+    ...extra,
+  };
+}
+
 export async function exchangeOAuth2Token(args: {
   config: OAuth2Config;
   redirectUri: string;
@@ -86,7 +94,9 @@ export async function exchangeOAuth2Token(args: {
   if (args.codeVerifier) form.set("code_verifier", args.codeVerifier);
   const resp = await fetch(args.config.tokenUrl, {
     method: "POST",
-    headers: { "Content-Type": "application/x-www-form-urlencoded" },
+    headers: getOAuthRequestHeaders({
+      "Content-Type": "application/x-www-form-urlencoded",
+    }),
     body: form.toString(),
   });
   const text = await resp.text();
@@ -122,10 +132,10 @@ export async function fetchOAuth2UserInfo(args: {
 }> {
   const resp = await fetch(args.config.userInfoUrl, {
     method: "GET",
-    headers: {
+    headers: getOAuthRequestHeaders({
       "Content-Type": "application/json",
       Authorization: `Bearer ${args.accessToken}`,
-    },
+    }),
   });
   const text = await resp.text();
   if (!resp.ok) {

@@ -7,7 +7,7 @@ import { Code, ConnectError } from "@connectrpc/connect";
 import type { FieldMask } from "@bufbuild/protobuf/wkt";
 import { timestampDate, timestampFromDate } from "@bufbuild/protobuf/wkt";
 import { getAccessToken, hasStoredToken, isTokenExpired, REQUEST_TOKEN_EXPIRY_BUFFER_MS, setAccessToken } from "./auth-state";
-import { memoFromJson, userFromJson } from "./lib/proto-adapters";
+import { memoFromJson, userFromJson, userStatsFromJson } from "./lib/proto-adapters";
 import { redirectOnAuthFailure } from "./utils/auth-redirect";
 import type {
   InstanceProfile,
@@ -530,10 +530,10 @@ export const userServiceClient = {
     const j = (await apiJson<Record<string, unknown>>(`/users/${pathSeg}`)) as Record<string, unknown>;
     return userFromJson(j);
   },
-  async getUserStats(req: { name: string }): Promise<Record<string, unknown>> {
+  async getUserStats(req: { name: string }) {
     const base = userSeg(req.name);
     const j = await apiJson<Record<string, unknown>>(`/users/${encodeURIComponent(`${base}:getStats`)}`);
-    return j;
+    return userStatsFromJson(j);
   },
   async updateUser(req: { user: User; updateMask: FieldMask }): Promise<User> {
     const username = userSeg(req.user.name);
@@ -541,10 +541,14 @@ export const userServiceClient = {
       method: "PATCH",
       body: JSON.stringify({
         user: {
+          username: req.user.username,
           displayName: req.user.displayName,
           email: req.user.email,
           password: (req.user as { password?: string }).password,
           role: req.user.role,
+          state: req.user.state,
+          avatarUrl: req.user.avatarUrl,
+          description: req.user.description,
         },
         updateMask: req.updateMask,
       }),
@@ -717,7 +721,7 @@ export const userServiceClient = {
   },
   async listAllUserStats(_req: object) {
     const j = await apiJson<{ stats: Record<string, unknown>[] }>("/users:stats");
-    return { stats: j.stats };
+    return { stats: j.stats.map((row) => userStatsFromJson(row)) };
   },
 };
 
@@ -785,21 +789,19 @@ export const memoServiceClient = {
     const j = await apiJson<Record<string, unknown>>("/memos", {
       method: "POST",
       body: JSON.stringify({
-        memo: {
-          content: m?.content,
-          visibility: m?.visibility,
-          state: m?.state,
-          pinned: m?.pinned,
-          ...(loc
-            ? {
-                location: {
-                  placeholder: loc.placeholder,
-                  latitude: loc.latitude,
-                  longitude: loc.longitude,
-                },
-              }
-            : {}),
-        },
+        content: m?.content,
+        visibility: m?.visibility,
+        state: m?.state,
+        pinned: m?.pinned,
+        ...(loc
+          ? {
+              location: {
+                placeholder: loc.placeholder,
+                latitude: loc.latitude,
+                longitude: loc.longitude,
+              },
+            }
+          : {}),
       }),
     });
     return memoFromJson(j);
@@ -854,7 +856,7 @@ export const memoServiceClient = {
     }
     const j = await apiJson<Record<string, unknown>>(`/memos/${encodeURIComponent(id)}`, {
       method: "PATCH",
-      body: JSON.stringify({ memo: patch }),
+      body: JSON.stringify(patch),
     });
     return memoFromJson(j);
   },
