@@ -62,13 +62,8 @@ All 9 business tables are **structurally identical** across both branches (colum
 
 | Module | `master` behavior | `golang` behavior |
 | --- | --- | --- |
-| **Memo `name` field** | `"memos/{integer_id}"` (e.g. `memos/42`) | `"memos/{uid}"` (e.g. `memos/01HX...`) — uses the `uid` text column |
-| **`PATCH /memos/{memo}`** | Applies any fields present in body; ignores `updateMask` | Requires `updateMask` in body (FieldMask) |
-| **`GET /memos` list params** | `pageSize`, `pageToken`, `filter`, `orderBy`, `state` | Same, plus `showDeleted` (bool) |
-| **`PATCH /users/{user}/settings/{setting}`** | Applies all fields in body | Requires `updateMask` in body |
 | **Instance `STORAGE` setting** | Returns extra `supportedStorageTypes` (dynamic, includes `R2`) | Fixed enum `DATABASE/LOCAL/S3`; no dynamic field — **excluded by design** |
-| **Memo `filter` / CEL** | Subset implementation in `server/lib/memo-filter.ts` | Full CEL compilation semantics |
-| **MCP routes** | Not implemented | `server/router/mcp/*` registered on echo router |
+| **Memo `filter` / CEL** | Subset implementation in `server/lib/memo-filter.ts` (covers common patterns used by the web client: creator, visibility, tag, pinned, time range, content.contains) | Full CEL compilation semantics |
 
 ### 2.4 Resolved gaps
 
@@ -82,6 +77,11 @@ All 9 business tables are **structurally identical** across both branches (colum
 | `POST /api/v1/users:batchGet` | ✅ Implemented |
 | Identity provider CRUD | ✅ Fully aligned |
 | GENERAL settings persistence (`additionalScript`, `additionalStyle`, `customProfile`, `weekStartDayOffset`) | ✅ Fixed |
+| **Memo `name` field** | ✅ Uses `"memos/{uid}"` (UUID v4 from `memo.uid` column) — aligned with golang |
+| **`PATCH /memos/{memo}` updateMask** | ✅ `updateMask` is now required in the request body; server applies only the paths listed |
+| **`GET /memos` `showDeleted` param** | ✅ `showDeleted=true` (or `show_deleted=true`) sets state to ARCHIVED — aligned with golang |
+| **`PATCH /users/{user}/settings/{setting}` updateMask** | ✅ Already enforced — rejects empty updateMask |
+| **MCP endpoint** | ✅ Implemented at `POST/GET/DELETE /mcp` (Streamable HTTP transport) in `server/routes/mcp.ts` |
 
 ---
 
@@ -128,7 +128,7 @@ The `/api/v1/sse` endpoint is mounted in `master` **Node.js only** (via `enableS
 | Primary DB | Node → SQLite; Worker → D1 (Cloudflare) | Single runtime (SQLite / PostgreSQL / MySQL via driver) |
 | Object storage | `DATABASE / LOCAL / S3 / R2` | `DATABASE / LOCAL / S3` (no R2) |
 | Realtime (SSE) | Node.js only; CF Worker excluded | Unconditionally available |
-| MCP | Not implemented | `server/router/mcp/*` |
+| MCP | ✅ Implemented at `/mcp` (Streamable HTTP, stateless per-request) | `server/router/mcp/*` (stateful sessions) |
 
 ---
 

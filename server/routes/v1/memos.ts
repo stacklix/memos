@@ -65,7 +65,12 @@ export function createMemoRoutes(deps: AppDeps) {
       const n = Number(b64urlToUtf8(token));
       offset = Number.isFinite(n) ? n : 0;
     }
-    const state = (c.req.query("state") as string | undefined) ?? "NORMAL";
+    // showDeleted=true shows ARCHIVED memos (golang `show_deleted` field).
+    const showDeletedRaw = c.req.query("showDeleted") ?? c.req.query("show_deleted");
+    const showDeleted = showDeletedRaw === "true" || showDeletedRaw === "1";
+    const state = showDeleted
+      ? "ARCHIVED"
+      : ((c.req.query("state") as string | undefined) ?? "NORMAL");
     const filterStr = c.req.query("filter") ?? "";
     const parsed = parseMemoListFilter(filterStr);
     const hasFilter = filterStr.trim().length > 0;
@@ -247,12 +252,25 @@ export function createMemoRoutes(deps: AppDeps) {
       state?: unknown;
       pinned?: boolean;
       displayTime?: string;
+      display_time?: string;
       location?: unknown;
+      updateMask?: { paths?: string[] };
+      update_mask?: { paths?: string[] };
     };
-    // Match golang v0.26.x contract: request body is Memo fields at top-level.
-    const m = (await c.req.json()) as MemoBody;
-    if (!m) return jsonError(c, GrpcCode.INVALID_ARGUMENT, "memo required");
-    const locPatch = parseMemoLocationForPatch(m.location);
+    const body = (await c.req.json()) as MemoBody;
+    if (!body) return jsonError(c, GrpcCode.INVALID_ARGUMENT, "memo required");
+    const rawPaths =
+      body.updateMask?.paths ?? body.update_mask?.paths ?? [];
+    if (rawPaths.length === 0) {
+      return jsonError(c, GrpcCode.INVALID_ARGUMENT, "update_mask is required");
+    }
+    const paths = new Set(rawPaths);
+    function hasPath(...keys: string[]): boolean {
+      return keys.some((k) => paths.has(k));
+    }
+    const locPatch = hasPath("location")
+      ? parseMemoLocationForPatch(body.location)
+      : { kind: "noop" as const };
     if (locPatch.kind === "error") {
       return jsonError(c, GrpcCode.INVALID_ARGUMENT, locPatch.message);
     }
@@ -263,11 +281,19 @@ export function createMemoRoutes(deps: AppDeps) {
           ? { location: locPatch.value }
           : {};
     await repo.updateMemo(id, {
-      content: m.content,
-      visibility: m.visibility !== undefined ? normalizeMemoVisibilityFromClient(m.visibility) : undefined,
-      state: m.state !== undefined ? normalizeMemoStateFromClient(m.state) : undefined,
-      pinned: m.pinned,
-      display_time: m.displayTime ?? null,
+      content: hasPath("content") ? body.content : undefined,
+      visibility:
+        hasPath("visibility") && body.visibility !== undefined
+          ? normalizeMemoVisibilityFromClient(body.visibility)
+          : undefined,
+      state:
+        hasPath("state") && body.state !== undefined
+          ? normalizeMemoStateFromClient(body.state)
+          : undefined,
+      pinned: hasPath("pinned") ? body.pinned : undefined,
+      display_time: hasPath("display_time", "displayTime")
+        ? (body.displayTime ?? body.display_time ?? null)
+        : undefined,
       ...locUpdate,
     });
     sseBus.emit({ type: "memo.updated", name: `memos/${id}` });

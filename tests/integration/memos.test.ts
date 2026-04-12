@@ -73,13 +73,29 @@ describe("integration: memos", () => {
     const patch = await apiJson(app, `/api/v1/memos/${encodeURIComponent(id)}`, {
       method: "PATCH",
       bearer: accessToken,
-      json: { content: "v2" },
+      json: { content: "v2", updateMask: { paths: ["content"] } },
     });
     expect(patch.status).toBe(200);
     expect((patch.body as { content: string }).content).toBe("v2");
 
     const get = await apiJson(app, `/api/v1/memos/${encodeURIComponent(id)}`, { bearer: accessToken });
     expect((get.body as { content: string }).content).toBe("v2");
+  });
+
+  it("PATCH memo without updateMask returns 400", async () => {
+    const app = createTestApp();
+    await postFirstUser(app, { username: "nomask", password: "secret123", role: "USER" });
+    const { accessToken } = await signIn(app, "nomask", "secret123");
+    const created = await postMemo(app, accessToken, { content: "v1", visibility: "PRIVATE" });
+    expect(created.status).toBe(200);
+    const id = memoIdFromName((created.body as { name: string }).name);
+
+    const patch = await apiJson(app, `/api/v1/memos/${encodeURIComponent(id)}`, {
+      method: "PATCH",
+      bearer: accessToken,
+      json: { content: "v2" },
+    });
+    expect(patch.status).toBe(400);
   });
 
   it("DELETE memo (soft) returns archived state to creator; ?force=true hard-deletes (404)", async () => {

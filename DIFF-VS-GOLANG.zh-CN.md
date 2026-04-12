@@ -62,13 +62,8 @@
 
 | 模块 | `master` 行为 | `golang` 行为 |
 | --- | --- | --- |
-| **Memo `name` 字段** | `"memos/{integer_id}"`（如 `memos/42`） | `"memos/{uid}"`（如 `memos/01HX...`），使用 `uid` 文本列 |
-| **`PATCH /memos/{memo}`** | 应用请求体中所有字段，忽略 `updateMask` | 请求体中必须包含 `updateMask`（FieldMask） |
-| **`GET /memos` 列表参数** | `pageSize`、`pageToken`、`filter`、`orderBy`、`state` | 同上，另加 `showDeleted`（bool） |
-| **`PATCH /users/{user}/settings/{setting}`** | 应用请求体所有字段 | 请求体中必须包含 `updateMask` |
 | **Instance `STORAGE` 设置** | 额外返回 `supportedStorageTypes`（动态，含 `R2`） | 固定枚举 `DATABASE/LOCAL/S3`，无动态字段 — **设计排除** |
-| **Memo `filter` / CEL** | `server/lib/memo-filter.ts` 为子集实现 | 完整 CEL 编译语义 |
-| **MCP 路由** | 未实现 | golang 注册了 `server/router/mcp/*` |
+| **Memo `filter` / CEL** | `server/lib/memo-filter.ts` 子集实现（覆盖 Web 客户端常用模式：creator、visibility、tag、pinned、时间范围、content.contains） | 完整 CEL 编译语义 |
 
 ### 2.4 已对齐项
 
@@ -82,6 +77,11 @@
 | `POST /api/v1/users:batchGet` | ✅ 已实现 |
 | 身份提供商 CRUD | ✅ 完全对齐 |
 | GENERAL 设置持久化（`additionalScript`、`additionalStyle`、`customProfile`、`weekStartDayOffset`） | ✅ 已修复 |
+| **Memo `name` 字段** | ✅ 已使用 `"memos/{uid}"`（UUID v4，来自 `memo.uid` 列）— 与 golang 对齐 |
+| **`PATCH /memos/{memo}` updateMask** | ✅ 请求体现在必须包含 `updateMask`；服务端仅应用指定路径的字段 |
+| **`GET /memos` `showDeleted` 参数** | ✅ `showDeleted=true`（或 `show_deleted=true`）将 state 设为 ARCHIVED — 与 golang 对齐 |
+| **`PATCH /users/{user}/settings/{setting}` updateMask** | ✅ 已强制校验 — 空 updateMask 会返回错误 |
+| **MCP 接口** | ✅ 已在 `server/routes/mcp.ts` 实现，挂载于 `POST/GET/DELETE /mcp`（Streamable HTTP 传输） |
 
 ---
 
@@ -128,7 +128,7 @@
 | 主数据库 | Node → SQLite；Worker → D1（Cloudflare） | 单一运行时（SQLite / PostgreSQL / MySQL） |
 | 对象存储 | `DATABASE / LOCAL / S3 / R2` | `DATABASE / LOCAL / S3`（无 R2） |
 | 实时推送（SSE） | 仅 Node.js；CF Worker 排除 | 无条件可用 |
-| MCP 接口 | 未实现 | `server/router/mcp/*` |
+| MCP 接口 | ✅ 已实现，挂载于 `/mcp`（无状态逐请求模式） | `server/router/mcp/*`（有状态会话模式） |
 
 ---
 

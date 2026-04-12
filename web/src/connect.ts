@@ -839,8 +839,9 @@ export const memoServiceClient = {
   },
   async updateMemo(req: { memo: Memo; updateMask: FieldMask }) {
     const id = memoIdFromName(req.memo.name);
+    const paths = req.updateMask.paths ?? [];
     const patch: Record<string, unknown> = {};
-    for (const p of req.updateMask.paths ?? []) {
+    for (const p of paths) {
       if (p === "content") patch.content = req.memo.content;
       if (p === "visibility") patch.visibility = req.memo.visibility;
       if (p === "state") patch.state = req.memo.state;
@@ -861,6 +862,8 @@ export const memoServiceClient = {
         }
       }
     }
+    // Send updateMask alongside memo fields so the server can validate it.
+    patch.updateMask = { paths };
     const j = await apiJson<Record<string, unknown>>(`/memos/${encodeURIComponent(id)}`, {
       method: "PATCH",
       body: JSON.stringify(patch),
