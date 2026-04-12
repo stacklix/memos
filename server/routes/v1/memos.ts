@@ -21,6 +21,7 @@ import {
 import { parseAttachmentFilter } from "../../lib/attachment-filter.js";
 import { parseInstanceNotificationSetting } from "../../lib/instance-notification-setting.js";
 import { dispatchMemoCommentWebhooks } from "../../services/user-webhook-dispatch.js";
+import { sseBus } from "../../lib/sse-bus.js";
 
 function memoIdFromName(name: string): string | null {
   const p = name.startsWith("memos/") ? name.slice("memos/".length) : name;
@@ -64,7 +65,12 @@ export function createMemoRoutes(deps: AppDeps) {
       const n = Number(b64urlToUtf8(token));
       offset = Number.isFinite(n) ? n : 0;
     }
-    const state = (c.req.query("state") as string | undefined) ?? "NORMAL";
+    // showDeleted=true shows ARCHIVED memos (golang `show_deleted` field).
+    const showDeletedRaw = c.req.query("showDeleted") ?? c.req.query("show_deleted");
+    const showDeleted = showDeletedRaw === "true" || showDeletedRaw === "1";
+    const state = showDeleted
+      ? "ARCHIVED"
+      : ((c.req.query("state") as string | undefined) ?? "NORMAL");
     const filterStr = c.req.query("filter") ?? "";
     const parsed = parseMemoListFilter(filterStr);
     const hasFilter = filterStr.trim().length > 0;
@@ -203,6 +209,7 @@ export function createMemoRoutes(deps: AppDeps) {
       pinned: Boolean(m.pinned),
       location: locIn.value,
     });
+    sseBus.emit({ type: "memo.created", name: `memos/${row.id}` });
     return c.json(memoToJson(row));
   });
 
@@ -245,12 +252,25 @@ export function createMemoRoutes(deps: AppDeps) {
       state?: unknown;
       pinned?: boolean;
       displayTime?: string;
+      display_time?: string;
       location?: unknown;
+      updateMask?: { paths?: string[] };
+      update_mask?: { paths?: string[] };
     };
-    // Match golang v0.26.x contract: request body is Memo fields at top-level.
-    const m = (await c.req.json()) as MemoBody;
-    if (!m) return jsonError(c, GrpcCode.INVALID_ARGUMENT, "memo required");
-    const locPatch = parseMemoLocationForPatch(m.location);
+    const body = (await c.req.json()) as MemoBody;
+    if (!body) return jsonError(c, GrpcCode.INVALID_ARGUMENT, "memo required");
+    const rawPaths =
+      body.updateMask?.paths ?? body.update_mask?.paths ?? [];
+    if (rawPaths.length === 0) {
+      return jsonError(c, GrpcCode.INVALID_ARGUMENT, "update_mask is required");
+    }
+    const paths = new Set(rawPaths);
+    function hasPath(...keys: string[]): boolean {
+      return keys.some((k) => paths.has(k));
+    }
+    const locPatch = hasPath("location")
+      ? parseMemoLocationForPatch(body.location)
+      : { kind: "noop" as const };
     if (locPatch.kind === "error") {
       return jsonError(c, GrpcCode.INVALID_ARGUMENT, locPatch.message);
     }
@@ -261,13 +281,22 @@ export function createMemoRoutes(deps: AppDeps) {
           ? { location: locPatch.value }
           : {};
     await repo.updateMemo(id, {
-      content: m.content,
-      visibility: m.visibility !== undefined ? normalizeMemoVisibilityFromClient(m.visibility) : undefined,
-      state: m.state !== undefined ? normalizeMemoStateFromClient(m.state) : undefined,
-      pinned: m.pinned,
-      display_time: m.displayTime ?? null,
+      content: hasPath("content") ? body.content : undefined,
+      visibility:
+        hasPath("visibility") && body.visibility !== undefined
+          ? normalizeMemoVisibilityFromClient(body.visibility)
+          : undefined,
+      state:
+        hasPath("state") && body.state !== undefined
+          ? normalizeMemoStateFromClient(body.state)
+          : undefined,
+      pinned: hasPath("pinned") ? body.pinned : undefined,
+      display_time: hasPath("display_time", "displayTime")
+        ? (body.displayTime ?? body.display_time ?? null)
+        : undefined,
       ...locUpdate,
     });
+    sseBus.emit({ type: "memo.updated", name: `memos/${id}` });
     const next = await repo.getMemoById(id);
     if (!next) return jsonError(c, GrpcCode.NOT_FOUND, "memo not found");
     return c.json(await memoToJsonWithAttachments(next));
@@ -282,7 +311,12 @@ export function createMemoRoutes(deps: AppDeps) {
     if (row.creator_username !== auth.username && auth.role !== "ADMIN") {
       return jsonError(c, GrpcCode.PERMISSION_DENIED, "permission denied");
     }
-    await repo.softDeleteMemo(id);
+    if (c.req.query("force") === "true") {
+      await repo.hardDeleteMemo(id);
+    } else {
+      await repo.archiveMemo(id);
+    }
+    sseBus.emit({ type: "memo.deleted", name: `memos/${id}` });
     return c.json({});
   });
 
@@ -455,6 +489,7 @@ export function createMemoRoutes(deps: AppDeps) {
         }
       }
     }
+    sseBus.emit({ type: "memo.comment.created", name: `memos/${row.id}`, parent: `memos/${id}` });
     return c.json(await memoToJsonWithAttachments(row));
   });
 
@@ -500,6 +535,7 @@ export function createMemoRoutes(deps: AppDeps) {
       creator: auth.username,
       reactionType: rt,
     });
+    sseBus.emit({ type: "reaction.upserted", name: `memos/${id}/reactions/${rid}`, parent: `memos/${id}` });
     const list = await repo.listReactions(id);
     const x = list.find((l) => l.creator_username === auth.username && l.reaction_type === rt);
     if (!x) return jsonError(c, GrpcCode.INTERNAL, "failed to read reaction");
@@ -525,6 +561,7 @@ export function createMemoRoutes(deps: AppDeps) {
       return jsonError(c, GrpcCode.PERMISSION_DENIED, "permission denied");
     }
     await repo.deleteReaction(memoId, c.req.param("rid"));
+    sseBus.emit({ type: "reaction.deleted", name: `memos/${memoId}/reactions/${c.req.param("rid")}`, parent: `memos/${memoId}` });
     return c.json({});
   });
 
