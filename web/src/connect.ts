@@ -723,6 +723,13 @@ export const userServiceClient = {
     const j = await apiJson<{ stats: Record<string, unknown>[] }>("/users:stats");
     return { stats: j.stats.map((row) => userStatsFromJson(row)) };
   },
+  async batchGetUsers(req: { usernames: string[] }): Promise<{ users: User[] }> {
+    const j = await apiJson<{ users?: Record<string, unknown>[] }>("/users:batchGet", {
+      method: "POST",
+      body: JSON.stringify({ usernames: req.usernames }),
+    });
+    return { users: (j.users ?? []).map((u) => userFromJson(u)) };
+  },
 };
 
 export const shortcutServiceClient = {
@@ -832,8 +839,9 @@ export const memoServiceClient = {
   },
   async updateMemo(req: { memo: Memo; updateMask: FieldMask }) {
     const id = memoIdFromName(req.memo.name);
+    const paths = req.updateMask.paths ?? [];
     const patch: Record<string, unknown> = {};
-    for (const p of req.updateMask.paths ?? []) {
+    for (const p of paths) {
       if (p === "content") patch.content = req.memo.content;
       if (p === "visibility") patch.visibility = req.memo.visibility;
       if (p === "state") patch.state = req.memo.state;
@@ -854,6 +862,8 @@ export const memoServiceClient = {
         }
       }
     }
+    // Send updateMask alongside memo fields so the server can validate it.
+    patch.updateMask = { paths };
     const j = await apiJson<Record<string, unknown>>(`/memos/${encodeURIComponent(id)}`, {
       method: "PATCH",
       body: JSON.stringify(patch),
@@ -1027,6 +1037,13 @@ export const attachmentServiceClient = {
   async deleteAttachment(req: { name: string }): Promise<object> {
     const id = req.name.replace(/^attachments\//, "");
     await apiJson(`/attachments/${encodeURIComponent(id)}`, { method: "DELETE" });
+    return {};
+  },
+  async batchDeleteAttachments(req: { names: string[] }): Promise<object> {
+    await apiJson("/attachments:batchDelete", {
+      method: "POST",
+      body: JSON.stringify({ names: req.names }),
+    });
     return {};
   },
 };
